@@ -1,0 +1,53 @@
+id = "worktrees"
+name = "herdr-worktrees"
+version = "0.2.0"
+min_herdr_version = "0.7.4"
+description = "Switch, create, and remove git worktrees from a popup — with merge/squash status and setup hooks."
+platforms = ["macos", "linux"]
+
+# Compiled binary; `plugin install` builds it, `plugin link` expects it built.
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# Each action opens one of the popup panes below in the workspace where the
+# action fired. The binary resolves the workspace cwd from the injected context,
+# reads the popup size from plugin config, and opens the pane as a session-modal
+# popup.
+[[actions]]
+id = "open"
+title = "Worktree: switch or create"
+contexts = ["workspace"]
+command = ["./target/release/herdr-worktrees", "open", "picker"]
+
+[[actions]]
+id = "open-base"
+title = "Worktree: create from a chosen base"
+contexts = ["workspace"]
+command = ["./target/release/herdr-worktrees", "open", "picker-base"]
+
+[[actions]]
+id = "remove"
+title = "Worktree: remove"
+contexts = ["workspace"]
+command = ["./target/release/herdr-worktrees", "open", "remover"]
+
+# Popup panes. A popup is a transient session-modal terminal: it receives all
+# input (including Escape) and closes when the command exits. width/height come
+# from [popup] in plugin config and are passed by the `open` action.
+[[panes]]
+id = "picker"
+title = "Worktrees"
+placement = "popup"
+command = ["bash", "-c", 'exec "$HERDR_PLUGIN_ROOT/target/release/herdr-worktrees" picker']
+
+[[panes]]
+id = "picker-base"
+title = "Worktrees — base branch"
+placement = "popup"
+command = ["bash", "-c", 'exec "$HERDR_PLUGIN_ROOT/target/release/herdr-worktrees" picker --base']
+
+[[panes]]
+id = "remover"
+title = "Worktrees — remove"
+placement = "popup"
+command = ["bash", "-c", 'exec "$HERDR_PLUGIN_ROOT/target/release/herdr-worktrees" remover']

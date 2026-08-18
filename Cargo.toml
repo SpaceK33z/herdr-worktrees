@@ -1,0 +1,27 @@
+[package]
+name = "herdr-worktrees"
+version = "0.2.0"
+edition = "2021"
+description = "Switch, create, and remove git worktrees from a Herdr popup"
+license = "MIT"
+authors = ["Kees Kluskens"]
+keywords = ["herdr", "git", "worktree", "tui", "fzf"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "herdr-worktrees"
+path = "src/main.rs"
+
+[lib]
+name = "herdr_worktrees"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+strip = true
