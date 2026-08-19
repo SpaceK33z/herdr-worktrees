@@ -30,7 +30,10 @@ pub fn notify(title: &str, body: &str, sound: &str) {
 
 /// Run a herdr command and return its parsed JSON on success.
 pub fn json(args: &[&str]) -> Option<Value> {
-    let out = std::process::Command::new(herdr_bin()).args(args).output().ok()?;
+    let out = std::process::Command::new(herdr_bin())
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -142,7 +145,10 @@ pub fn current_workspace() -> Option<String> {
     let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
     if !ctx.is_empty() {
         if let Ok(v) = serde_json::from_str::<Value>(&ctx) {
-            if let Some(ws) = v["workspace_id"].as_str().or(v["focused_workspace_id"].as_str()) {
+            if let Some(ws) = v["workspace_id"]
+                .as_str()
+                .or(v["focused_workspace_id"].as_str())
+            {
                 return Some(ws.to_string());
             }
         }

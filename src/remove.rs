@@ -8,54 +8,326 @@ use crate::model;
 use crate::render;
 use crate::tty;
 use anyhow::{Context as _, Result};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::ffi::CString;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+const COL_SAFETY: usize = 16;
+const PROGRESS_DONE: &str = "__HERDR_WORKTREE_REMOVE_DONE__";
+const PROGRESS_UPDATE: &str = "__HERDR_WORKTREE_REMOVE_UPDATE__";
+
+#[derive(Debug, Clone)]
+struct RemovalTarget {
+    branch: String,
+    path: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedRemoval {
+    branch: String,
+    path: String,
+    head: String,
+    authorized_risk: Option<RemovalRisk>,
+    publication_proof: Option<PublicationProof>,
+}
+
+#[derive(Debug, Clone)]
+struct PublicationProof {
+    reference: String,
+    oid: String,
+}
+
+struct RemovalInspection {
+    prepared: PreparedRemoval,
+    changes: RemovalChanges,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RemovalChanges {
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+}
+
+impl RemovalChanges {
+    fn dirty(self) -> bool {
+        self.staged > 0 || self.unstaged > 0 || self.untracked > 0
+    }
+
+    fn display(self) -> String {
+        if !self.dirty() {
+            "clean".to_string()
+        } else if self.staged == 0 && self.unstaged == 0 {
+            "untracked".to_string()
+        } else if self.untracked == 0 {
+            format!("+{} ~{}", self.staged, self.unstaged)
+        } else {
+            format!("+{} ~{} ?{}", self.staged, self.unstaged, self.untracked)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalRisk {
+    Dirty,
+    Unpublished,
+    DirtyAndUnpublished,
+    Detached,
+    DirtyAndDetached,
+}
+
+impl RemovalRisk {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Dirty => "uncommitted changes",
+            Self::Unpublished => "unpublished commits",
+            Self::DirtyAndUnpublished => "uncommitted changes and unpublished commits",
+            Self::Detached => "a detached HEAD",
+            Self::DirtyAndDetached => "uncommitted changes and a detached HEAD",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dirty => "⚠ dirty",
+            Self::Unpublished => "⚠ unpublished",
+            Self::DirtyAndUnpublished => "⚠ dirty + unpub",
+            Self::Detached => "⚠ detached",
+            Self::DirtyAndDetached => "⚠ dirty + detach",
+        }
+    }
+
+    fn code(self) -> &'static str {
+        match self {
+            Self::Dirty => "dirty",
+            Self::Unpublished => "unpublished",
+            Self::DirtyAndUnpublished => "dirty-unpublished",
+            Self::Detached => "detached",
+            Self::DirtyAndDetached => "dirty-detached",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "dirty" => Some(Self::Dirty),
+            "unpublished" => Some(Self::Unpublished),
+            "dirty-unpublished" => Some(Self::DirtyAndUnpublished),
+            "detached" => Some(Self::Detached),
+            "dirty-detached" => Some(Self::DirtyAndDetached),
+            _ => None,
+        }
+    }
+
+    fn dirty(self) -> bool {
+        matches!(
+            self,
+            Self::Dirty | Self::DirtyAndUnpublished | Self::DirtyAndDetached
+        )
+    }
+
+    fn unpublished(self) -> bool {
+        matches!(self, Self::Unpublished | Self::DirtyAndUnpublished)
+    }
+
+    fn detached(self) -> bool {
+        matches!(self, Self::Detached | Self::DirtyAndDetached)
+    }
+}
 
 pub fn run_interactive() -> Result<()> {
     let repo_path = git::repo_root()?;
     let repo = repo_path.to_string_lossy().into_owned();
     let config = Config::load()?;
     let state_dir = model::state_dir();
-    let engine = model::compute_all(&repo, &config, &state_dir, false);
+    let list = render_remove_candidates(&repo, &config, &state_dir, false);
 
-    let header = render::render_header();
-    let footer = "enter remove · ctrl-x remove despite dirty/unmerged · esc cancel";
-
-    // Removable = every worktree whose path differs from the main checkout.
-    let mut candidates: Vec<String> = Vec::new();
-    for wt in &engine.worktrees {
-        if wt.path == repo {
-            continue;
-        }
-        let branch_disp = if wt.branch.is_empty() {
-            "(detached)".to_string()
-        } else {
-            wt.branch.clone()
-        };
-        let row = render::render_row(&branch_disp, wt, &engine.prefix);
-        candidates.push(format!(
-            "{branch_disp}\t{}\t{}\t{}\t{row}",
-            wt.path, wt.status_kind, wt.changes
-        ));
-    }
-    if candidates.is_empty() {
+    let header = format!(
+        "{}  {}",
+        render::pad("safety", COL_SAFETY),
+        render::render_header()
+    );
+    let footer = "tab select · shift-tab deselect · enter remove selected/current · ctrl-r recheck";
+    if list.is_empty() {
         println!("\x1b[33mNo removable worktrees (only the main checkout exists).\x1b[0m");
         tty::wait_key();
         return Ok(());
     }
-    let list = candidates.join("\n");
+
+    let exe = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "herdr-worktrees".to_string());
+    let refresh_cmd = format!("{} remove-list", crate::util::shell_escape(&exe));
     let cur_path = git::current_toplevel();
-
-    let Some(sel) = run_remove_fzf(&list, &header, footer, &cur_path)? else {
+    let selections = run_remove_fzf(&list, &header, footer, &cur_path, &refresh_cmd)?;
+    let targets = parse_targets(&selections);
+    if targets.is_empty() {
         return Ok(());
-    };
+    }
+    delete_worktrees(&targets, &config, &repo)
+}
 
-    let parts: Vec<&str> = sel.split('\t').collect();
-    let branch = parts.first().copied().unwrap_or("");
-    let path = parts.get(1).copied().unwrap_or("");
-    let kind = parts.get(2).copied().unwrap_or("");
-    let changes = parts.get(3).copied().unwrap_or("");
-    delete_worktree(branch, path, kind, changes, &config, &repo)
+/// Print the untracked-aware candidate list used by fzf's background reload.
+pub fn run_list(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        anyhow::bail!("usage: remove-list");
+    }
+    let repo_path = git::repo_root()?;
+    let repo = repo_path.to_string_lossy().into_owned();
+    let config = Config::load()?;
+    let state_dir = model::state_dir();
+    print!(
+        "{}",
+        render_remove_candidates(&repo, &config, &state_dir, true)
+    );
+    Ok(())
+}
+
+fn render_remove_candidates(
+    repo: &str,
+    config: &Config,
+    state_dir: &Path,
+    inspect: bool,
+) -> String {
+    let engine = if inspect {
+        model::compute_remove_snapshot(repo, config, state_dir)
+    } else {
+        model::compute_remove_initial(repo, config, state_dir)
+    };
+    let removable: Vec<_> = engine
+        .worktrees
+        .iter()
+        .filter(|worktree| worktree.path != repo)
+        .collect();
+    let inspections = inspect.then(|| inspect_candidates(&removable, config));
+    let mut rows = Vec::with_capacity(removable.len());
+
+    for (index, worktree) in removable.into_iter().enumerate() {
+        let branch = branch_name(worktree);
+        let mut display = worktree.clone();
+        let safety = if let Some(inspections) = &inspections {
+            match &inspections[index] {
+                Ok(inspection) => {
+                    display.staged = inspection.changes.staged;
+                    display.unstaged = inspection.changes.unstaged;
+                    display.dirty = inspection.changes.dirty();
+                    display.changes = inspection.changes.display();
+                    render_safety(inspection.prepared.authorized_risk)
+                }
+                Err(_) => {
+                    display.changes = "unknown".to_string();
+                    render_unverified()
+                }
+            }
+        } else {
+            render_checking()
+        };
+        let row = render::render_row(&branch, &display, &engine.prefix);
+        rows.push(format!("{branch}\t{}\t{safety}  {row}", worktree.path));
+    }
+    rows.join("\n")
+}
+
+fn inspect_candidates(
+    worktrees: &[&model::Worktree],
+    config: &Config,
+) -> Vec<Result<RemovalInspection>> {
+    if worktrees.is_empty() {
+        return Vec::new();
+    }
+    let workers = worktrees.len().min(8);
+    let chunk_size = worktrees.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        worktrees
+            .chunks(chunk_size)
+            .map(|chunk| {
+                (
+                    chunk.len(),
+                    scope.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|worktree| inspect_candidate(worktree, config))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|(len, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    (0..len)
+                        .map(|_| Err(anyhow::anyhow!("safety check panicked")))
+                        .collect()
+                })
+            })
+            .collect()
+    })
+}
+
+fn inspect_targets(
+    targets: &[RemovalTarget],
+    config: &Config,
+    repo: &str,
+) -> Vec<Result<PreparedRemoval>> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let records = match registered_worktrees(repo) {
+        Ok(records) => records,
+        Err(error) => {
+            let message = format!("{error:#}");
+            return targets
+                .iter()
+                .map(|_| Err(anyhow::anyhow!(message.clone())))
+                .collect();
+        }
+    };
+    let workers = targets.len().min(8);
+    let chunk_size = targets.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        targets
+            .chunks(chunk_size)
+            .map(|chunk| {
+                (
+                    chunk.len(),
+                    scope.spawn(|| {
+                        chunk
+                            .iter()
+                            .map(|target| inspect_target_in_records(target, &records, config, repo))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|(len, handle)| {
+                handle.join().unwrap_or_else(|_| {
+                    (0..len)
+                        .map(|_| Err(anyhow::anyhow!("safety check panicked")))
+                        .collect()
+                })
+            })
+            .collect()
+    })
+}
+
+fn inspect_candidate(worktree: &model::Worktree, config: &Config) -> Result<RemovalInspection> {
+    let changes = inspect_changes(&worktree.path)?;
+    let detached = worktree.branch.is_empty();
+    let unpublished =
+        config.delete_branch() && !detached && sync_has_unpublished(&worktree.sync_kind);
+    Ok(RemovalInspection {
+        prepared: PreparedRemoval {
+            branch: branch_name(worktree),
+            path: worktree.path.clone(),
+            head: worktree.head.clone(),
+            authorized_risk: removal_risk(changes.dirty(), unpublished, detached),
+            publication_proof: None,
+        },
+        changes,
+    })
 }
 
 /// The `remove --target <branch> <path> <kind> <changes>` one-off delete used by
@@ -84,116 +356,735 @@ pub fn run_target(args: &[String]) -> Result<()> {
 pub fn delete_worktree(
     branch: &str,
     path: &str,
-    kind: &str,
+    _kind: &str,
     _changes: &str,
     config: &Config,
     repo: &str,
 ) -> Result<()> {
-    // The picker list computes a fast tracked-only status; re-check with a full
-    // status (including untracked files) so deletion stays safe.
-    let dirty = model::worktree_dirty(path);
-    let unmerged = matches!(kind, "ahead" | "behind" | "diverged");
-    let require_force = (dirty || unmerged) && !config.force();
-    let prompt = if require_force {
-        format!(
-            "  ⚠ '{branch}' has uncommitted changes / unmerged work — ctrl-x to remove anyway, any other key to cancel"
-        )
-    } else {
-        format!("  remove '{branch}'? enter to confirm, any other key to cancel")
-    };
+    delete_worktrees(
+        &[RemovalTarget {
+            branch: branch.to_string(),
+            path: path.to_string(),
+        }],
+        config,
+        repo,
+    )
+}
+
+fn delete_worktrees(targets: &[RemovalTarget], config: &Config, repo: &str) -> Result<()> {
+    if targets.iter().any(|target| target.path == repo) {
+        tty::err("the main checkout can't be removed");
+        return Ok(());
+    }
+
+    // Re-check identity, HEAD, dirty files, and publication state immediately
+    // before confirmation. A failed probe cancels rather than becoming `safe`.
+    let mut prepared = Vec::with_capacity(targets.len());
+    for (target, inspection) in targets.iter().zip(inspect_targets(targets, config, repo)) {
+        match inspection {
+            Ok(target) => prepared.push(target),
+            Err(error) => {
+                tty::err(&format!(
+                    "could not verify '{}'; nothing was removed: {error:#}",
+                    target.branch
+                ));
+                tty::wait_key();
+                return Ok(());
+            }
+        }
+    }
+    let risks: Vec<_> = prepared
+        .iter()
+        .filter_map(|target| target.authorized_risk)
+        .collect();
+    let require_force = !risks.is_empty() && !config.force();
+    let prompt = removal_prompt(targets, &risks, require_force);
     if !tty::confirm(&prompt, require_force) {
         return Ok(());
     }
 
-    // Detach the deletion so the popup closes immediately; a Herdr notification
-    // reports the result (including the size) when it finishes.
+    // One detached process removes the whole selection and sends one summary
+    // notification, rather than opening a process and notification per row.
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "herdr-worktrees".to_string());
     let log = background::log_path("remove");
-    let args = [
-        "remove-bg".to_string(),
-        branch.to_string(),
-        path.to_string(),
-        repo.to_string(),
-    ];
-    background::spawn_detached(&exe, &args, &log)?;
-    println!("removing '{branch}' in the background…");
+    std::fs::File::create(&log).context("creating removal progress log")?;
+    open_progress_pane(targets, config, repo, &log, &exe);
+
+    let mut args = vec!["remove-bg-batch".to_string(), repo.to_string()];
+    for target in &prepared {
+        args.push(target.branch.clone());
+        args.push(target.path.clone());
+        args.push(target.head.clone());
+        args.push(
+            target
+                .authorized_risk
+                .map(RemovalRisk::code)
+                .unwrap_or("safe")
+                .to_string(),
+        );
+    }
+    if let Err(error) = background::spawn_detached(&exe, &args, &log) {
+        append_progress(&log, &format!("Could not start removal: {error}"));
+        append_progress(&log, PROGRESS_DONE);
+        return Err(error.into());
+    }
+    if targets.len() == 1 {
+        println!("removing '{}' in the background…", targets[0].branch);
+    } else {
+        println!("removing {} worktrees in the background…", targets.len());
+    }
     Ok(())
 }
 
-/// Detached background mode: perform the deletion, then notify Herdr.
-pub fn run_background(args: &[String]) -> Result<()> {
-    if args.len() != 3 {
-        anyhow::bail!("usage: remove-bg <branch> <path> <repo>");
+fn open_progress_pane(
+    targets: &[RemovalTarget],
+    config: &Config,
+    repo: &str,
+    log: &str,
+    exe: &str,
+) {
+    let label = if targets.len() == 1 {
+        format!("Removing {}", targets[0].branch)
+    } else {
+        format!("Removing {} worktrees", targets.len())
+    };
+
+    let pane = if targets.len() == 1 && config.open_mode() == "workspace" {
+        let target = &targets[0];
+        match herdr::worktree_workspace_id(&target.path, repo) {
+            Some(workspace) => herdr::open_tab_pane(Some(&workspace), &target.path, &label),
+            None => herdr::open_worktree_pane(
+                herdr::root_workspace(repo).as_deref(),
+                repo,
+                &target.path,
+                &label,
+            ),
+        }
+    } else {
+        let cwd = if targets.len() == 1 {
+            targets[0].path.as_str()
+        } else {
+            repo
+        };
+        herdr::open_tab_pane(herdr::current_workspace().as_deref(), cwd, &label)
+    };
+
+    if let Some(pane) = pane {
+        let command = format!(
+            "{} remove-progress {}; exit",
+            crate::util::shell_escape(exe),
+            crate::util::shell_escape(log),
+        );
+        herdr::run_in_pane(&pane, &command);
     }
-    let (branch, path, repo) = (&args[0], &args[1], &args[2]);
-    let config = Config::load()?;
-    match perform_delete(branch, path, &config, repo) {
-        Ok(bytes) => herdr::notify(
-            "worktree removed",
-            &format!("removed '{branch}' ({})", human_bytes(bytes)),
-            "done",
-        ),
-        Err(e) => {
-            let log = std::env::var("WT_LOG").unwrap_or_default();
-            let body = if log.is_empty() {
-                format!("failed to remove '{branch}': {e:#}")
+}
+
+fn append_progress(log: &str, message: &str) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        let _ = writeln!(file, "{message}");
+        let _ = file.flush();
+    }
+}
+
+fn removal_risk(dirty: bool, unpublished: bool, detached: bool) -> Option<RemovalRisk> {
+    if detached {
+        return Some(if dirty {
+            RemovalRisk::DirtyAndDetached
+        } else {
+            RemovalRisk::Detached
+        });
+    }
+    match (dirty, unpublished) {
+        (true, true) => Some(RemovalRisk::DirtyAndUnpublished),
+        (true, false) => Some(RemovalRisk::Dirty),
+        (false, true) => Some(RemovalRisk::Unpublished),
+        (false, false) => None,
+    }
+}
+
+fn render_safety(risk: Option<RemovalRisk>) -> String {
+    let (label, color) = match risk {
+        Some(risk) => (
+            risk.label(),
+            if matches!(
+                risk,
+                RemovalRisk::Dirty
+                    | RemovalRisk::DirtyAndUnpublished
+                    | RemovalRisk::DirtyAndDetached
+            ) {
+                "31"
             } else {
-                format!("failed to remove '{branch}': {e:#} — {log}")
-            };
-            herdr::notify("worktree removal failed", &body, "request");
+                "33"
+            },
+        ),
+        None => ("✓ safe", "32"),
+    };
+    format!("\x1b[{color}m{}\x1b[0m", render::pad(label, COL_SAFETY))
+}
+
+fn render_unverified() -> String {
+    format!(
+        "\x1b[31m{}\x1b[0m",
+        render::pad("✕ verify failed", COL_SAFETY)
+    )
+}
+
+fn render_checking() -> String {
+    format!("\x1b[33m{}\x1b[0m", render::pad("… checking", COL_SAFETY))
+}
+
+fn removal_prompt(targets: &[RemovalTarget], risks: &[RemovalRisk], require_force: bool) -> String {
+    if targets.len() == 1 {
+        let branch = &targets[0].branch;
+        if require_force {
+            return format!(
+                "  ⚠ '{branch}' has {} — ctrl-x to remove anyway, any other key to cancel",
+                risks[0].description()
+            );
+        }
+        return format!("  remove '{branch}'? enter to confirm, any other key to cancel");
+    }
+
+    if require_force {
+        format!(
+            "  ⚠ {} of {} selected worktrees are not safe to remove — ctrl-x to remove all anyway, any other key to cancel",
+            risks.len(),
+            targets.len()
+        )
+    } else {
+        format!(
+            "  remove {} selected worktrees? enter to confirm, any other key to cancel",
+            targets.len()
+        )
+    }
+}
+
+fn parse_targets(selections: &[String]) -> Vec<RemovalTarget> {
+    selections
+        .iter()
+        .filter_map(|selection| {
+            let mut parts = selection.split('\t');
+            let branch = parts.next()?;
+            let path = parts.next()?;
+            if branch.is_empty() || path.is_empty() {
+                return None;
+            }
+            Some(RemovalTarget {
+                branch: branch.to_string(),
+                path: path.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn branch_name(worktree: &model::Worktree) -> String {
+    if worktree.branch.is_empty() {
+        "(detached)".to_string()
+    } else {
+        worktree.branch.clone()
+    }
+}
+
+fn inspect_target(target: &RemovalTarget, config: &Config, repo: &str) -> Result<PreparedRemoval> {
+    let records = registered_worktrees(repo)?;
+    inspect_target_in_records(target, &records, config, repo)
+}
+
+fn registered_worktrees(repo: &str) -> Result<Vec<model::RawWorktree>> {
+    let output = git::git_output(&["-C", repo, "worktree", "list", "--porcelain"])
+        .context("listing registered worktrees")?;
+    if !output.status.success() {
+        anyhow::bail!("git worktree list failed");
+    }
+    Ok(model::parse_worktree_list(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn inspect_target_in_records(
+    target: &RemovalTarget,
+    records: &[model::RawWorktree],
+    config: &Config,
+    repo: &str,
+) -> Result<PreparedRemoval> {
+    let record = records
+        .iter()
+        .find(|record| record.path == target.path)
+        .with_context(|| format!("{} is no longer a registered worktree", target.path))?;
+    let actual_branch = if record.branch.is_empty() {
+        "(detached)"
+    } else {
+        &record.branch
+    };
+    if actual_branch != target.branch {
+        anyhow::bail!(
+            "worktree branch changed from '{}' to '{actual_branch}'",
+            target.branch
+        );
+    }
+
+    let changes = inspect_changes(&target.path)?;
+    let detached = record.branch.is_empty();
+    let (unpublished, publication_proof) = if config.delete_branch() && !detached {
+        branch_publication(repo, &record.branch)?
+    } else {
+        (false, None)
+    };
+
+    Ok(PreparedRemoval {
+        branch: target.branch.clone(),
+        path: target.path.clone(),
+        head: record.head.clone(),
+        authorized_risk: removal_risk(changes.dirty(), unpublished, detached),
+        publication_proof,
+    })
+}
+
+fn inspect_changes(path: &str) -> Result<RemovalChanges> {
+    let output = git::git_output(&[
+        "--no-optional-locks",
+        "-C",
+        path,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+        "--ignore-submodules=none",
+    ])
+    .with_context(|| format!("checking worktree status for {path}"))?;
+    if !output.status.success() {
+        anyhow::bail!("git status failed for {path}");
+    }
+
+    Ok(parse_changes(&output.stdout))
+}
+
+fn parse_changes(output: &[u8]) -> RemovalChanges {
+    let mut changes = RemovalChanges::default();
+    for line in output.split(|byte| *byte == b'\n') {
+        if line.len() < 2 {
+            continue;
+        }
+        if line[0] == b'?' && line[1] == b'?' {
+            changes.untracked += 1;
+            continue;
+        }
+        if line[0] != b' ' && line[0] != b'?' {
+            changes.staged += 1;
+        }
+        if line[1] != b' ' {
+            changes.unstaged += 1;
         }
     }
+    changes
+}
+
+fn sync_has_unpublished(sync_kind: &str) -> bool {
+    !matches!(sync_kind, "synced" | "behind")
+}
+
+fn branch_publication(repo: &str, branch: &str) -> Result<(bool, Option<PublicationProof>)> {
+    let Some(upstream) = git::branch_upstream(repo, branch) else {
+        // Failure to resolve an upstream is conservative: keeping the branch is
+        // safe, deleting it needs explicit force confirmation.
+        return Ok((true, None));
+    };
+    let oid = git::git_stdout(&[
+        "-C",
+        repo,
+        "for-each-ref",
+        "--format=%(objectname)",
+        &upstream,
+    ]);
+    let oid = oid.trim();
+    if oid.is_empty() {
+        return Ok((true, None));
+    }
+
+    // Compare against the captured object, not the mutable ref name. The same
+    // OID is verified in the update-ref transaction before branch deletion.
+    let range = format!("{oid}..{branch}");
+    let output = git::git_output(&["-C", repo, "rev-list", "--count", &range])
+        .context("checking unpublished commits")?;
+    if !output.status.success() {
+        anyhow::bail!("git rev-list failed while checking {branch}");
+    }
+    let count: u64 = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse()
+        .context("parsing unpublished commit count")?;
+    if count > 0 {
+        Ok((true, None))
+    } else {
+        Ok((
+            false,
+            Some(PublicationProof {
+                reference: upstream,
+                oid: oid.to_string(),
+            }),
+        ))
+    }
+}
+
+fn risk_is_covered(authorized: Option<RemovalRisk>, current: Option<RemovalRisk>) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    let Some(authorized) = authorized else {
+        return false;
+    };
+    (!current.dirty() || authorized.dirty())
+        && (!current.unpublished() || authorized.unpublished())
+        && (!current.detached() || authorized.detached())
+}
+
+/// Follow a removal log in a temporary Herdr pane until the worker writes its
+/// completion marker.
+pub fn run_progress(args: &[String]) -> Result<()> {
+    if args.len() != 1 {
+        anyhow::bail!("usage: remove-progress <log>");
+    }
+    let log = &args[0];
+    let mut shown = 0usize;
+    let mut pending = String::new();
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")?
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    progress.set_message("Preparing removal…");
+    progress.enable_steady_tick(Duration::from_millis(80));
+
+    loop {
+        if let Ok(bytes) = std::fs::read(log) {
+            if bytes.len() < shown {
+                shown = 0;
+                pending.clear();
+            }
+            if bytes.len() > shown {
+                pending.push_str(&String::from_utf8_lossy(&bytes[shown..]));
+                shown = bytes.len();
+                while let Some(newline) = pending.find('\n') {
+                    let line: String = pending.drain(..=newline).collect();
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    if line == PROGRESS_DONE {
+                        progress.finish_and_clear();
+                        return Ok(());
+                    }
+                    if let Some(update) = line.strip_prefix(PROGRESS_UPDATE) {
+                        progress.set_message(update.to_string());
+                    } else {
+                        progress.println(line);
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn report_progress(message: &str) {
+    println!("{message}");
+    let _ = std::io::stdout().flush();
+}
+
+fn report_progress_update(message: &str) {
+    println!("{PROGRESS_UPDATE}{message}");
+    let _ = std::io::stdout().flush();
+}
+
+struct ProgressCompletion;
+
+impl Drop for ProgressCompletion {
+    fn drop(&mut self) {
+        report_progress(PROGRESS_DONE);
+    }
+}
+
+/// Detached background mode for a multi-selection. All removals share one
+/// process and produce one summary notification.
+pub fn run_background_batch(args: &[String]) -> Result<()> {
+    if args.len() < 5 || !(args.len() - 1).is_multiple_of(4) {
+        anyhow::bail!(
+            "usage: remove-bg-batch <repo> <branch> <path> <head> <risk> [<branch> <path> <head> <risk> ...]"
+        );
+    }
+    let _completion = ProgressCompletion;
+    let repo = &args[0];
+    let config = Config::load()?;
+    let total = (args.len() - 1) / 4;
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    let mut failures = Vec::new();
+
+    for (index, fields) in args[1..].chunks_exact(4).enumerate() {
+        report_progress_update(&format!(
+            "[{}/{}] Verifying '{}'…",
+            index + 1,
+            total,
+            fields[0]
+        ));
+        let authorized_risk = if fields[3] == "safe" {
+            None
+        } else {
+            match RemovalRisk::from_code(&fields[3]) {
+                Some(risk) => Some(risk),
+                None => {
+                    let failure = format!("'{}': invalid safety authorization", fields[0]);
+                    report_progress(&format!("✕ [{}/{}] {failure}", index + 1, total));
+                    failures.push(failure);
+                    continue;
+                }
+            }
+        };
+        let target = PreparedRemoval {
+            branch: fields[0].clone(),
+            path: fields[1].clone(),
+            head: fields[2].clone(),
+            authorized_risk,
+            publication_proof: None,
+        };
+        match validate_and_delete(&target, &config, repo) {
+            Ok((size, warning)) => {
+                removed += 1;
+                bytes += size;
+                report_progress(&format!(
+                    "✓ [{}/{}] Removed '{}'{}",
+                    index + 1,
+                    total,
+                    target.branch,
+                    freed_suffix(size)
+                ));
+                if let Some(warning) = warning {
+                    failures.push(format!("'{}': {warning}", target.branch));
+                }
+            }
+            Err(error) => {
+                let failure = format!("'{}': {error:#}", target.branch);
+                report_progress(&format!("✕ [{}/{}] {failure}", index + 1, total));
+                failures.push(failure);
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        let title = if total == 1 {
+            "worktree removed"
+        } else {
+            "worktrees removed"
+        };
+        let body = if total == 1 {
+            format!("removed '{}'{}", args[1], freed_suffix(bytes))
+        } else {
+            format!("removed {total} worktrees{}", freed_suffix(bytes))
+        };
+        herdr::notify(title, &body, "done");
+    } else {
+        let log = std::env::var("WT_LOG").unwrap_or_default();
+        let mut body = format!(
+            "removed {removed} of {total}; failed to remove {}",
+            failures.join(", ")
+        );
+        if !log.is_empty() {
+            body.push_str(&format!(" — {log}"));
+        }
+        herdr::notify("worktree removal incomplete", &body, "request");
+    }
     Ok(())
 }
 
-/// Delete the checkout's files (counting bytes), then clean up the git
-/// worktree registration, branch, and any open Herdr workspace.
-fn perform_delete(branch: &str, path: &str, config: &Config, repo: &str) -> Result<u64> {
-    // Resolve the open herdr workspace before removing the checkout — once the
-    // git worktree is gone, `herdr worktree list` no longer reports its id.
-    let wsid = herdr::worktree_workspace_id(path, repo);
-
-    let mut deleted = 0u64;
-    delete_tree(Path::new(path), true, &mut deleted);
-
-    if !git::git_success(&["-C", repo, "worktree", "remove", "--force", path]) {
-        anyhow::bail!("git worktree remove failed");
+fn validate_and_delete(
+    target: &PreparedRemoval,
+    config: &Config,
+    repo: &str,
+) -> Result<(u64, Option<String>)> {
+    let current = inspect_target(
+        &RemovalTarget {
+            branch: target.branch.clone(),
+            path: target.path.clone(),
+        },
+        config,
+        repo,
+    )?;
+    if current.head != target.head {
+        anyhow::bail!("HEAD changed after confirmation; worktree was kept");
     }
-
-    if config.delete_branch() && !branch.is_empty() && branch != "(detached)" {
-        let _ = git::git_success(&["-C", repo, "branch", "-D", branch]);
+    if !risk_is_covered(target.authorized_risk, current.authorized_risk) {
+        anyhow::bail!("safety state changed after confirmation; worktree was kept");
     }
+    let publication_proof = if target.authorized_risk.is_some_and(RemovalRisk::unpublished) {
+        None
+    } else {
+        current.publication_proof.as_ref()
+    };
+    perform_delete(target, config, repo, publication_proof)
+}
+
+/// Let Git validate and remove the registered worktree while estimating freed
+/// disk space from the containing filesystem. Plugin code never erases paths.
+fn perform_delete(
+    target: &PreparedRemoval,
+    config: &Config,
+    repo: &str,
+    publication_proof: Option<&PublicationProof>,
+) -> Result<(u64, Option<String>)> {
+    let wsid = herdr::worktree_workspace_id(&target.path, repo);
+
+    let mut args = vec!["-C", repo, "worktree", "remove"];
+    if target.authorized_risk.is_some_and(RemovalRisk::dirty) {
+        args.push("--force");
+    }
+    args.push(&target.path);
+    report_progress_update(&format!("Removing '{}'…", target.branch));
+    let freed = remove_with_progress(&args, Path::new(&target.path))?;
 
     if let Some(ws) = wsid {
         herdr::run(&["workspace".into(), "close".into(), ws]);
     }
 
-    Ok(deleted)
+    if config.delete_branch()
+        && target.branch != "(detached)"
+        && !delete_branch_ref(repo, target, publication_proof)
+    {
+        return Ok((
+            freed,
+            Some(
+                "worktree removed, but branch or publication state changed, so the branch was kept"
+                    .to_string(),
+            ),
+        ));
+    }
+
+    Ok((freed, None))
 }
 
-fn run_remove_fzf(list: &str, header: &str, footer: &str, cur_path: &str) -> Result<Option<String>> {
-    let mut args: Vec<String> = vec![
-        "--delimiter=\t".into(),
-        "--with-nth=5".into(),
-        "--accept-nth=1,2,3,4".into(),
-        "--prompt=remove ❯ ".into(),
-        "--header".into(),
-        header.to_string(),
-        "--footer".into(),
-        footer.to_string(),
-        "--ansi".into(),
-        "--reverse".into(),
-        "--info=inline".into(),
-        "--border=rounded".into(),
-    ];
-    if !cur_path.is_empty() {
-        if let Some(idx) = model::fzf_line_index(list, cur_path) {
-            args.push("--bind".into());
-            args.push(format!("load:pos({idx})"));
-        }
+fn delete_branch_ref(
+    repo: &str,
+    target: &PreparedRemoval,
+    publication_proof: Option<&PublicationProof>,
+) -> bool {
+    let local_ref = format!("refs/heads/{}", target.branch);
+    let Some(proof) = publication_proof else {
+        return git::git_success(&["-C", repo, "update-ref", "-d", &local_ref, &target.head]);
+    };
+
+    let mut child = match std::process::Command::new("git")
+        .env("LC_ALL", "C")
+        .args(["-C", repo, "update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let transaction = format!(
+        "start\nverify {} {}\ndelete {} {}\nprepare\ncommit\n",
+        proof.reference, proof.oid, local_ref, target.head
+    );
+    if child
+        .stdin
+        .take()
+        .is_none_or(|mut stdin| stdin.write_all(transaction.as_bytes()).is_err())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
     }
+    child.wait().is_ok_and(|status| status.success())
+}
+
+fn remove_with_progress(args: &[&str], worktree_path: &Path) -> Result<u64> {
+    let probe = worktree_path
+        .parent()
+        .filter(|path| path.exists())
+        .unwrap_or(worktree_path);
+    let initial_available = available_space(probe);
+    let started = Instant::now();
+    let mut last_report = Instant::now();
+    let mut last_reported_bytes = 0u64;
+    let mut max_freed = 0u64;
+
+    let mut child = std::process::Command::new("git")
+        .args(args)
+        .spawn()
+        .context("starting git worktree remove")?;
+
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting for git worktree remove")?
+        {
+            break status;
+        }
+
+        if let (Some(initial), Some(current)) = (initial_available, available_space(probe)) {
+            max_freed = max_freed.max(current.saturating_sub(initial));
+        }
+        if last_report.elapsed() >= Duration::from_secs(1)
+            || max_freed.saturating_sub(last_reported_bytes) >= 1024 * 1024
+        {
+            if max_freed > 0 {
+                report_progress_update(&format!(
+                    "Removing files · ~{} freed · {:.1}s elapsed",
+                    human_bytes(max_freed),
+                    started.elapsed().as_secs_f64()
+                ));
+            } else {
+                report_progress_update(&format!(
+                    "Removing files · {:.1}s elapsed",
+                    started.elapsed().as_secs_f64()
+                ));
+            }
+            last_report = Instant::now();
+            last_reported_bytes = max_freed;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    if status.success() && initial_available.is_some() {
+        // Give filesystems with slightly delayed free-space accounting one last
+        // chance to publish the blocks released by Git.
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let (Some(initial), Some(current)) = (initial_available, available_space(probe)) {
+        max_freed = max_freed.max(current.saturating_sub(initial));
+    }
+    if !status.success() {
+        anyhow::bail!("git worktree remove failed; the branch was kept");
+    }
+    Ok(max_freed)
+}
+
+fn available_space(path: &Path) -> Option<u64> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    fn into_u64<T: Into<u64>>(value: T) -> u64 {
+        value.into()
+    }
+    Some(into_u64(stats.f_bavail).saturating_mul(into_u64(stats.f_frsize)))
+}
+
+fn run_remove_fzf(
+    list: &str,
+    header: &str,
+    footer: &str,
+    cur_path: &str,
+    refresh_cmd: &str,
+) -> Result<Vec<String>> {
+    let mut args = remove_fzf_args(header, footer);
+    args.push("--bind".into());
+    args.push(build_remove_bind(list, cur_path, refresh_cmd));
     let mut child = std::process::Command::new("fzf")
         .args(&args)
         .stdin(std::process::Stdio::piped())
@@ -205,30 +1096,48 @@ fn run_remove_fzf(list: &str, header: &str, footer: &str, cur_path: &str) -> Res
         let _ = stdin.write_all(list.as_bytes());
     }
     let out = child.wait_with_output()?;
-    let sel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(if sel.is_empty() { None } else { Some(sel) })
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
-/// Recursively delete a directory tree, accumulating the bytes removed. The
-/// top-level `.git` pointer is left for `git worktree remove` to clean up.
-fn delete_tree(dir: &Path, skip_git: bool, deleted: &mut u64) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+fn remove_fzf_args(header: &str, footer: &str) -> Vec<String> {
+    vec![
+        "--delimiter=\t".into(),
+        "--with-nth=3".into(),
+        "--accept-nth=1,2".into(),
+        "--id-nth=1,2".into(),
+        "--multi".into(),
+        "--marker=●".into(),
+        "--prompt=remove ❯ ".into(),
+        "--header".into(),
+        header.to_string(),
+        "--footer".into(),
+        footer.to_string(),
+        "--ansi".into(),
+        "--reverse".into(),
+        "--info=inline".into(),
+        "--border=rounded".into(),
+    ]
+}
+
+fn build_remove_bind(list: &str, cur_path: &str, refresh_cmd: &str) -> String {
+    let load = match model::fzf_line_index(list, cur_path) {
+        Some(index) if !cur_path.is_empty() => {
+            format!("load:pos({index})+unbind(load)+reload-sync({refresh_cmd})")
+        }
+        _ => format!("load:unbind(load)+reload-sync({refresh_cmd})"),
     };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if skip_git && entry.file_name().to_string_lossy() == ".git" {
-            continue;
-        }
-        let Ok(ft) = entry.file_type() else { continue };
-        if ft.is_dir() {
-            delete_tree(&p, false, deleted);
-            let _ = std::fs::remove_dir(&p);
-        } else {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            let _ = std::fs::remove_file(&p);
-            *deleted += size;
-        }
+    format!("{load},change:first,ctrl-r:reload-sync({refresh_cmd})")
+}
+
+fn freed_suffix(bytes: u64) -> String {
+    if bytes == 0 {
+        String::new()
+    } else {
+        format!(" (~{} freed)", human_bytes(bytes))
     }
 }
 
@@ -243,5 +1152,308 @@ fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", b / 1024.0)
     } else {
         format!("{b:.0} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        branch_publication, build_remove_bind, delete_branch_ref, freed_suffix, inspect_target,
+        parse_changes, parse_targets, removal_risk, remove_fzf_args, render_remove_candidates,
+        risk_is_covered, sync_has_unpublished, validate_and_delete, PreparedRemoval,
+        RemovalChanges, RemovalRisk, RemovalTarget,
+    };
+    use crate::config::Config;
+    use std::path::Path;
+    use std::process::Command;
+
+    #[test]
+    fn preserving_the_branch_only_guards_uncommitted_changes() {
+        assert_eq!(removal_risk(false, false, false), None);
+        assert_eq!(removal_risk(true, false, false), Some(RemovalRisk::Dirty));
+    }
+
+    #[test]
+    fn deleting_the_branch_also_guards_unpublished_commits() {
+        assert!(!sync_has_unpublished("synced"));
+        assert!(!sync_has_unpublished("behind"));
+        assert!(sync_has_unpublished("ahead"));
+        assert!(sync_has_unpublished("diverged"));
+        assert!(sync_has_unpublished("local"));
+        assert!(sync_has_unpublished("gone"));
+        assert_eq!(
+            removal_risk(false, true, false),
+            Some(RemovalRisk::Unpublished)
+        );
+        assert_eq!(
+            removal_risk(true, true, false),
+            Some(RemovalRisk::DirtyAndUnpublished)
+        );
+        assert_eq!(removal_risk(false, false, false), None);
+    }
+
+    #[test]
+    fn detached_worktrees_are_never_marked_safe() {
+        assert_eq!(
+            removal_risk(false, false, true),
+            Some(RemovalRisk::Detached)
+        );
+        assert_eq!(
+            removal_risk(true, false, true),
+            Some(RemovalRisk::DirtyAndDetached)
+        );
+    }
+
+    #[test]
+    fn worker_rejects_new_risks_after_confirmation() {
+        assert!(!risk_is_covered(None, Some(RemovalRisk::Dirty)));
+        assert!(!risk_is_covered(
+            Some(RemovalRisk::Dirty),
+            Some(RemovalRisk::DirtyAndUnpublished)
+        ));
+        assert!(risk_is_covered(
+            Some(RemovalRisk::DirtyAndUnpublished),
+            Some(RemovalRisk::Dirty)
+        ));
+    }
+
+    #[test]
+    fn unavailable_disk_delta_is_not_rendered_as_zero_bytes() {
+        assert_eq!(freed_suffix(0), "");
+        assert_eq!(freed_suffix(1024), " (~1.0 KB freed)");
+    }
+
+    #[test]
+    fn parses_every_fzf_multi_selection() {
+        let targets = parse_targets(&["one\t/tmp/one".to_string(), "two\t/tmp/two".to_string()]);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].branch, "one");
+        assert_eq!(targets[1].path, "/tmp/two");
+    }
+
+    #[test]
+    fn removal_changes_distinguish_untracked_files() {
+        let parsed = parse_changes(b"M  staged\n M unstaged\n?? untracked\n");
+        assert_eq!(
+            (parsed.staged, parsed.unstaged, parsed.untracked),
+            (1, 1, 1)
+        );
+        assert_eq!(RemovalChanges::default().display(), "clean");
+        assert_eq!(
+            RemovalChanges {
+                untracked: 2,
+                ..RemovalChanges::default()
+            }
+            .display(),
+            "untracked"
+        );
+        assert_eq!(
+            RemovalChanges {
+                staged: 1,
+                unstaged: 2,
+                untracked: 3,
+            }
+            .display(),
+            "+1 ~2 ?3"
+        );
+    }
+
+    #[test]
+    fn remove_binding_enriches_without_changing_item_identity() {
+        let args = remove_fzf_args("header", "footer");
+        assert!(args.iter().any(|arg| arg == "--multi"));
+        assert!(args.iter().any(|arg| arg == "--id-nth=1,2"));
+        let list = "one\t/tmp/one\tchecking\ntwo\t/tmp/two\tchecking";
+        let bind = build_remove_bind(list, "/tmp/two", "picker remove-list");
+        assert!(bind.starts_with("load:pos(2)+unbind(load)+reload-sync(picker remove-list)"));
+        assert!(bind.contains("ctrl-r:reload-sync(picker remove-list)"));
+    }
+
+    #[test]
+    fn enrichment_keeps_identity_and_overrides_hidden_untracked_config() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-remove-picker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("seed"), "seed").unwrap();
+        git(&repo, &["add", "seed"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+        git(&repo, &["branch", "feature"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "feature",
+            ],
+        );
+        git(&repo, &["config", "status.showUntrackedFiles", "no"]);
+        std::fs::write(worktree.join("untracked"), "unsafe").unwrap();
+
+        let config = Config::default();
+        let state = root.join("state");
+        let repo = repo.to_str().unwrap();
+        let initial = render_remove_candidates(repo, &config, &state, false);
+        let enriched = render_remove_candidates(repo, &config, &state, true);
+        let identity = |row: &str| {
+            row.split('\t')
+                .take(2)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(identity(&initial), identity(&enriched));
+        assert!(initial.contains("… checking"));
+        assert!(enriched.contains("⚠ dirty"));
+        assert!(enriched.contains("untracked"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn worker_rejects_untracked_changes_added_after_confirmation() {
+        let root = unique_root("safety-recheck");
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        git(&repo, &["branch", "feature"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "feature",
+            ],
+        );
+        let target = RemovalTarget {
+            branch: "feature".to_string(),
+            path: std::fs::canonicalize(&worktree)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        };
+        let prepared = inspect_target(&target, &Config::default(), repo.to_str().unwrap()).unwrap();
+        assert_eq!(prepared.authorized_risk, None);
+        std::fs::write(worktree.join("late-untracked"), "unsafe").unwrap();
+
+        assert!(
+            validate_and_delete(&prepared, &Config::default(), repo.to_str().unwrap()).is_err()
+        );
+        assert!(worktree.is_dir());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn publication_transaction_keeps_branch_when_upstream_moves() {
+        let root = unique_root("publication-proof");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        git(&repo, &["branch", "feature"]);
+        let feature_head = git_output(&repo, &["rev-parse", "feature"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://example.invalid/repo.git",
+            ],
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/feature", &feature_head],
+        );
+        git(
+            &repo,
+            &["branch", "--set-upstream-to=upstream/feature", "feature"],
+        );
+        let (unpublished, proof) = branch_publication(repo.to_str().unwrap(), "feature").unwrap();
+        assert!(!unpublished);
+        assert_eq!(
+            proof.as_ref().map(|proof| proof.reference.as_str()),
+            Some("refs/remotes/upstream/feature")
+        );
+
+        std::fs::write(repo.join("later"), "later").unwrap();
+        git(&repo, &["add", "later"]);
+        git(&repo, &["commit", "-qm", "later"]);
+        let new_remote = git_output(&repo, &["rev-parse", "main"]);
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/feature", &new_remote],
+        );
+        let target = PreparedRemoval {
+            branch: "feature".to_string(),
+            path: String::new(),
+            head: feature_head.clone(),
+            authorized_risk: None,
+            publication_proof: None,
+        };
+        assert!(!delete_branch_ref(
+            repo.to_str().unwrap(),
+            &target,
+            proof.as_ref()
+        ));
+        assert_eq!(git_output(&repo, &["rev-parse", "feature"]), feature_head);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn unique_root(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-remove-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn init_repo(repo: &Path) {
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("seed"), "seed").unwrap();
+        git(repo, &["add", "seed"]);
+        git(repo, &["commit", "-qm", "seed"]);
+    }
+
+    fn git_output(dir: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

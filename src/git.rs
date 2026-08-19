@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 pub fn git_output(args: &[&str]) -> std::io::Result<Output> {
-    std::process::Command::new("git").args(args).output()
+    std::process::Command::new("git")
+        .env("LC_ALL", "C")
+        .args(args)
+        .output()
 }
 
 pub fn git_stdout(args: &[&str]) -> String {
@@ -16,7 +19,9 @@ pub fn git_stdout(args: &[&str]) -> String {
 }
 
 pub fn git_success(args: &[&str]) -> bool {
-    git_output(args).map(|o| o.status.success()).unwrap_or(false)
+    git_output(args)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// The main working-tree path (the repo root), not the current worktree.
@@ -27,7 +32,10 @@ pub fn repo_root() -> Result<PathBuf> {
         anyhow::bail!("not inside a git repository");
     }
     let p = PathBuf::from(cdir);
-    if p.file_name().map(|f| f.to_string_lossy() == ".git").unwrap_or(false) {
+    if p.file_name()
+        .map(|f| f.to_string_lossy() == ".git")
+        .unwrap_or(false)
+    {
         Ok(p.parent().map(Path::to_path_buf).unwrap_or(p))
     } else {
         Ok(p)
@@ -61,17 +69,39 @@ pub fn current_branch() -> String {
 
 /// The top-level path of the current worktree (the process's cwd).
 pub fn current_toplevel() -> String {
-    git_stdout(&["rev-parse", "--show-toplevel"]).trim().to_string()
+    git_stdout(&["rev-parse", "--show-toplevel"])
+        .trim()
+        .to_string()
 }
 
 pub fn ref_exists(repo: &str, refname: &str) -> bool {
     git_success(&["-C", repo, "rev-parse", "-q", "--verify", refname])
 }
 
-/// Resolve the base branch/ref. Prefers the remote tracking branch over the
-/// local one: local `main` is often stale, which would falsely report a branch
-/// as ahead of main and merged branches as unmerged. "Ahead of main" should
-/// mean "ahead of the main that's actually on the remote".
+/// Resolve the full remote-tracking ref used to measure push/pull state.
+/// Prefer the configured upstream, then fall back to `origin/<branch>` when
+/// that ref exists (useful when a branch was pushed without `--set-upstream`).
+pub fn branch_upstream(repo: &str, branch: &str) -> Option<String> {
+    let local_ref = format!("refs/heads/{branch}");
+    let configured = git_stdout(&[
+        "-C",
+        repo,
+        "for-each-ref",
+        "--format=%(upstream)",
+        &local_ref,
+    ]);
+    let configured = configured.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+
+    let origin = format!("refs/remotes/origin/{branch}");
+    ref_exists(repo, &origin).then_some(origin)
+}
+
+/// Resolve the base ref used when creating a worktree. Prefer the remote-
+/// tracking branch so new work starts from the latest fetched base rather than
+/// a potentially stale local checkout.
 pub fn resolve_base_ref(config: &Config, repo: &str, current_branch: &str) -> String {
     if let Some(cfg) = &config.base_branch {
         if !cfg.is_empty() {

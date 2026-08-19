@@ -62,9 +62,9 @@ impl Config {
     }
 
     pub fn worktree_path_template(&self) -> String {
-        self.worktree_path.clone().unwrap_or_else(|| {
-            "{{ repo_path }}/.worktrees/{{ branch | sanitize }}".to_string()
-        })
+        self.worktree_path
+            .clone()
+            .unwrap_or_else(|| "{{ repo_path }}/.worktrees/{{ branch | sanitize }}".to_string())
     }
 
     /// "tab" or "workspace" (default).

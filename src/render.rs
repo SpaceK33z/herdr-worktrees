@@ -1,6 +1,7 @@
 //! Column layout and display rendering for the fzf list.
 
 use crate::model::Worktree;
+use crate::theme::{AnsiColor, ThemeColors};
 
 pub const COL_BRANCH: usize = 32;
 pub const COL_PR: usize = 8;
@@ -8,7 +9,7 @@ pub const COL_REVIEW: usize = 8;
 pub const COL_CONFLICT: usize = 8;
 pub const COL_WHEN: usize = 6;
 pub const COL_CHANGES: usize = 10;
-pub const COL_STATUS: usize = 10;
+pub const COL_SYNC: usize = 10;
 
 /// Truncate/pad a plain (ANSI-free) string to exactly `w` characters.
 pub fn pad(s: &str, w: usize) -> String {
@@ -54,28 +55,50 @@ pub fn branch_cell(branch: &str, width: usize, prefix: &str) -> String {
     }
 }
 
-pub fn status_colored(s: &str, kind: &str) -> String {
+pub fn sync_colored(s: &str, kind: &str) -> String {
     let color = match kind {
-        "merged" => "2",
-        "squashed" => "32",
+        "merged" => "32",
         "ahead" => "33",
-        "behind" => "31",
+        "behind" | "gone" => "31",
         "diverged" => "35",
         _ => "2",
     };
     format!("\x1b[{color}m{s}\x1b[0m")
 }
 
-/// One display line: branch, PR, review, conflict, when, changes, status.
+/// One display line: branch, PR, review, conflict, when, changes, sync.
 pub fn render_row(branch_disp: &str, wt: &Worktree, prefix: &str) -> String {
-    let b = branch_cell(branch_disp, COL_BRANCH, prefix);
+    let branch = branch_cell(branch_disp, COL_BRANCH, prefix);
+    render_cells(branch, wt)
+}
+
+pub fn render_picker_row(
+    branch_disp: &str,
+    wt: &Worktree,
+    prefix: &str,
+    color: &AnsiColor,
+) -> String {
+    let branch = color.paint(&branch_cell(branch_disp, COL_BRANCH, prefix));
+    render_cells(branch, wt)
+}
+
+pub fn render_picker_header(colors: &ThemeColors) -> String {
+    format!(
+        "{}    {}\n{}",
+        colors.worktrees.paint_bold("WORKTREES"),
+        colors.branches.paint_bold("BRANCHES"),
+        render_header()
+    )
+}
+
+fn render_cells(branch: String, wt: &Worktree) -> String {
     let pr = pr_cell(wt.pr_number, wt.pr_url.as_deref(), COL_PR);
-    let rv = review_cell(&wt.review, COL_REVIEW);
-    let cf = conflict_cell(wt.conflict, COL_CONFLICT);
-    let w = pad(&wt.when, COL_WHEN);
-    let c = pad(&wt.changes, COL_CHANGES);
-    let st = status_colored(&trunc(&wt.status, COL_STATUS), &wt.status_kind);
-    format!("{b}  {pr}  {rv}  {cf}  {w}  {c}  {st}")
+    let review = review_cell(&wt.review, COL_REVIEW);
+    let conflict = conflict_cell(wt.conflict, COL_CONFLICT);
+    let when = pad(&wt.when, COL_WHEN);
+    let changes = pad(&wt.changes, COL_CHANGES);
+    let sync = sync_colored(&trunc(&wt.sync, COL_SYNC), &wt.sync_kind);
+    format!("{branch}  {pr}  {review}  {conflict}  {when}  {changes}  {sync}")
 }
 
 /// PR number as an OSC 8 clickable link (opens on ctrl-click).
@@ -130,7 +153,7 @@ pub fn render_header() -> String {
         pad("conflict", COL_CONFLICT),
         pad("when", COL_WHEN),
         pad("changes", COL_CHANGES),
-        "status"
+        "sync"
     )
 }
 

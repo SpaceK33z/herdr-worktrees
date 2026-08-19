@@ -14,6 +14,7 @@ pub mod remove;
 pub mod render;
 pub mod setup;
 pub mod status;
+pub mod theme;
 pub mod tty;
 pub mod util;
 
@@ -25,8 +26,10 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("open") => open::run(&args[1..]),
         Some("picker") => picker::run(&args[1..]),
         Some("remover") => remove::run_interactive(),
+        Some("remove-list") => remove::run_list(&args[1..]),
         Some("remove") => remove::run_target(&args[1..]),
-        Some("remove-bg") => remove::run_background(&args[1..]),
+        Some("remove-bg-batch") => remove::run_background_batch(&args[1..]),
+        Some("remove-progress") => remove::run_progress(&args[1..]),
         Some("setup") => setup::run_cli(&args[1..]),
         Some("setup-bg") => setup::run_background(&args[1..]),
         _ => model::run_engine(args),

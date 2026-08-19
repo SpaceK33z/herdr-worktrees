@@ -46,12 +46,17 @@ fn workspace_cwd() -> Option<String> {
     let ctx = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").unwrap_or_default();
     if !ctx.is_empty() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ctx) {
-            if let Some(c) = v["workspace_cwd"].as_str().or(v["focused_pane_cwd"].as_str()) {
+            if let Some(c) = v["workspace_cwd"]
+                .as_str()
+                .or(v["focused_pane_cwd"].as_str())
+            {
                 if !c.is_empty() {
                     return Some(c.to_string());
                 }
             }
         }
     }
-    std::env::var("HERDR_ACTIVE_PANE_CWD").ok().filter(|c| !c.is_empty())
+    std::env::var("HERDR_ACTIVE_PANE_CWD")
+        .ok()
+        .filter(|c| !c.is_empty())
 }

@@ -2,7 +2,7 @@ id = "worktrees"
 name = "herdr-worktrees"
 version = "0.2.0"
 min_herdr_version = "0.7.4"
-description = "Switch, create, and remove git worktrees from a popup — with merge/squash status and setup hooks."
+description = "Switch, create, and remove git worktrees from a popup, with branch sync, PR status, and setup hooks."
 platforms = ["macos", "linux"]
 
 # Compiled binary; `plugin install` builds it, `plugin link` expects it built.

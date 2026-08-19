@@ -3,7 +3,6 @@
 use herdr_worktrees::config::{apply_branch_prefix, branch_short_name, Config};
 use herdr_worktrees::model;
 use herdr_worktrees::render;
-use herdr_worktrees::status;
 use herdr_worktrees::util;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -62,13 +61,178 @@ fn pure_helpers() {
     assert_eq!(apply_branch_prefix("/hotfix", "kees/"), "hotfix");
     assert_eq!(branch_short_name("kees/foo", "kees/"), "foo");
     assert_eq!(branch_short_name("foo", "kees/"), "foo");
+    assert_eq!(
+        model::origin_local_branch("origin/feature/x"),
+        Some("feature/x")
+    );
+    assert_eq!(model::origin_local_branch("origin/HEAD"), None);
+    assert_eq!(model::origin_local_branch("upstream/feature"), None);
 
     let h = render::render_header();
     assert!(h.contains("branch"));
     assert!(h.contains("pr"));
     assert!(h.contains("review"));
     assert!(h.contains("conflict"));
-    assert!(h.contains("status"));
+    assert!(h.contains("sync"));
+}
+
+#[test]
+fn remote_origin_local_branch_rejects_option_like_local_names() {
+    assert_eq!(model::origin_local_branch("origin/-feature"), None);
+}
+
+#[test]
+fn base_branch_shows_unpushed_commits_without_attributing_them_to_other_branches() {
+    let tmp = unique_dir("unpushed-base");
+    let scratch = tmp.join("repo");
+    std::fs::create_dir_all(&scratch).unwrap();
+    git(&scratch, &["init", "-q", "-b", "main"]);
+    git(&scratch, &["config", "user.email", "t@t.co"]);
+    git(&scratch, &["config", "user.name", "Tester"]);
+
+    std::fs::write(scratch.join("a"), "a\n").unwrap();
+    git(&scratch, &["add", "."]);
+    git(&scratch, &["commit", "-qm", "initial"]);
+    let remote_head = git(&scratch, &["rev-parse", "HEAD"]);
+    git(
+        &scratch,
+        &["update-ref", "refs/remotes/origin/main", remote_head.trim()],
+    );
+    git(
+        &scratch,
+        &["branch", "--set-upstream-to=origin/main", "main"],
+    );
+
+    for (file, message) in [("b", "local one"), ("c", "local two")] {
+        std::fs::write(scratch.join(file), format!("{file}\n")).unwrap();
+        git(&scratch, &["add", "."]);
+        git(&scratch, &["commit", "-qm", message]);
+    }
+    git(&scratch, &["branch", "runs"]);
+    git(
+        &scratch,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            tmp.join("wt-runs").to_str().unwrap(),
+            "runs",
+        ],
+    );
+
+    let config = Config {
+        base_branch: Some("main".to_string()),
+        github_prs: Some(false),
+        ..Config::default()
+    };
+    let engine = model::compute_all(
+        scratch.to_str().unwrap(),
+        &config,
+        &tmp.join("state"),
+        false,
+    );
+    let sync = |branch: &str| {
+        let wt = engine
+            .worktrees
+            .iter()
+            .find(|wt| wt.branch == branch)
+            .unwrap();
+        (wt.sync_kind.as_str(), wt.sync.as_str())
+    };
+
+    assert_eq!(engine.base, "origin/main");
+    assert_eq!(sync("main"), ("ahead", "↑2"));
+    assert_eq!(sync("runs"), ("local", "local"));
+
+    let initial =
+        model::compute_picker_initial(scratch.to_str().unwrap(), &config, &tmp.join("state"));
+    let remove_initial =
+        model::compute_remove_initial(scratch.to_str().unwrap(), &config, &tmp.join("state"));
+    assert_eq!(remove_initial.worktrees.len(), initial.worktrees.len());
+    assert!(remove_initial.branches.is_empty());
+    let main = initial
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.branch == "main")
+        .unwrap();
+    assert_eq!(
+        (main.sync_kind.as_str(), main.sync.as_str()),
+        ("loading", "…")
+    );
+
+    std::fs::remove_dir_all(&tmp).ok();
+}
+
+#[test]
+fn remote_only_origin_branches_are_emitted_once_and_filtered() {
+    let tmp = unique_dir("remote-only");
+    let repo = tmp.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@t.co"]);
+    git(&repo, &["config", "user.name", "Tester"]);
+    std::fs::write(repo.join("file"), "initial\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "initial"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let head = head.trim();
+
+    git(&repo, &["update-ref", "refs/remotes/origin/main", head]);
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/origin/remote-only", head],
+    );
+    git(&repo, &["update-ref", "refs/remotes/origin/matched", head]);
+    git(&repo, &["branch", "matched", head]);
+    git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/alias",
+            "refs/remotes/origin/remote-only",
+        ],
+    );
+    git(
+        &repo,
+        &["update-ref", "refs/remotes/upstream/not-origin", head],
+    );
+
+    let config = Config {
+        github_prs: Some(false),
+        ..Config::default()
+    };
+    let engine = model::compute_picker_initial(repo.to_str().unwrap(), &config, &tmp.join("state"));
+    let candidates: Vec<_> = engine
+        .remote_branches
+        .iter()
+        .map(|branch| branch.branch.as_str())
+        .collect();
+    assert_eq!(candidates, vec!["origin/remote-only"]);
+    assert_ne!(engine.remote_branches[0].when, "—");
+
+    let rows = model::render_fzf_lines(&engine, false);
+    let remote_rows: Vec<_> = rows
+        .lines()
+        .filter(|line| line.split('\t').nth(2) == Some("remote"))
+        .collect();
+    assert_eq!(remote_rows.len(), 1);
+    assert!(remote_rows[0].starts_with("origin/remote-only\t\tremote\t"));
+    assert!(!rows.contains("origin/HEAD"));
+    assert!(!rows.contains("origin/matched"));
+    assert!(!rows.contains("upstream/not-origin"));
+    let local_row = rows.find("matched\t").unwrap();
+    let remote_row = rows.find("origin/remote-only\t").unwrap();
+    assert!(local_row < remote_row);
+
+    std::fs::remove_dir_all(tmp).ok();
 }
 
 #[test]
@@ -119,8 +283,7 @@ echo "setting up {{ }}"
     assert_eq!(config.resolved_prefix("tester"), "kees/");
     assert_eq!(config.base_branch.as_deref(), Some("main"));
 
-    // Build a scratch repo: a merged branch, a squash-merged branch, and an
-    // ahead branch, each in its own worktree.
+    // Build a scratch repo with several local branches and worktrees.
     let scratch = tmp.join("repo");
     std::fs::create_dir_all(&scratch).unwrap();
     git(&scratch, &["init", "-q", "-b", "main"]);
@@ -135,7 +298,17 @@ echo "setting up {{ }}"
     git(&scratch, &["add", "."]);
     git(&scratch, &["commit", "-qm", "merge me"]);
     git(&scratch, &["checkout", "-q", "main"]);
-    git(&scratch, &["merge", "-q", "--no-ff", "merged-branch", "-m", "merge branch"]);
+    git(
+        &scratch,
+        &[
+            "merge",
+            "-q",
+            "--no-ff",
+            "merged-branch",
+            "-m",
+            "merge branch",
+        ],
+    );
 
     git(&scratch, &["checkout", "-q", "-b", "squash-branch"]);
     std::fs::write(scratch.join("s"), "s\n").unwrap();
@@ -151,77 +324,83 @@ echo "setting up {{ }}"
     git(&scratch, &["commit", "-qm", "ahead work"]);
     git(&scratch, &["checkout", "-q", "main"]);
 
-    // A branch equal to the base is locally "merged", but an unmerged PR with
-    // no unique commits should display no merged status, even if that local
-    // result was already cached.
-    let main_head = git(&scratch, &["rev-parse", "main"]);
     git(
         &scratch,
-        &["update-ref", "refs/heads/empty-pr", main_head.trim()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            tmp.join("wt-merged").to_str().unwrap(),
+            "merged-branch",
+        ],
     );
-    let empty_head = git(&scratch, &["rev-parse", "empty-pr"]);
-    assert!(!empty_head.trim().is_empty());
-    assert_eq!(
-        status::compute_status(
-            "empty-pr",
-            "main",
-            empty_head.trim(),
-            true,
-            scratch.to_str().unwrap(),
-            &tmp.join("status-state"),
-            status::PrStatus::None,
-        ),
-        ("merged".to_string(), "merged".to_string())
-    );
-    assert_eq!(
-        status::compute_status(
-            "empty-pr",
-            "main",
-            empty_head.trim(),
-            true,
-            scratch.to_str().unwrap(),
-            &tmp.join("status-state"),
-            status::PrStatus::Unmerged,
-        ),
-        ("other".to_string(), "—".to_string())
-    );
-    git(&scratch, &["branch", "-D", "empty-pr"]);
-
-    git(&scratch, &["worktree", "add", "-q", tmp.join("wt-merged").to_str().unwrap(), "merged-branch"]);
-    git(&scratch, &["worktree", "add", "-q", tmp.join("wt-squash").to_str().unwrap(), "squash-branch"]);
-    git(&scratch, &["worktree", "add", "-q", tmp.join("wt-ahead").to_str().unwrap(), "ahead-branch"]);
-    // The status probe above may use a synthetic commit; restore the inactive
-    // branch explicitly before exercising picker discovery.
     git(
         &scratch,
-        &["update-ref", "refs/heads/empty-pr", main_head.trim()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            tmp.join("wt-squash").to_str().unwrap(),
+            "squash-branch",
+        ],
     );
+    git(
+        &scratch,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            tmp.join("wt-ahead").to_str().unwrap(),
+            "ahead-branch",
+        ],
+    );
+    git(&scratch, &["branch", "empty-pr", "main"]);
 
-    let engine = model::compute_all(scratch.to_str().unwrap(), &config, &tmp.join("state"), false);
+    let engine = model::compute_all(
+        scratch.to_str().unwrap(),
+        &config,
+        &tmp.join("state"),
+        false,
+    );
+    let initial =
+        model::compute_picker_initial(scratch.to_str().unwrap(), &config, &tmp.join("state"));
+    assert!(initial
+        .worktrees
+        .iter()
+        .all(|worktree| worktree.changes == "…"));
+    assert_eq!(initial.worktrees.len(), engine.worktrees.len());
+    assert_eq!(initial.branches.len(), engine.branches.len());
 
-    let status_kind = |b: &str| {
+    let sync_kind = |b: &str| {
         engine
             .worktrees
             .iter()
             .find(|w| w.branch == b)
-            .map(|w| w.status_kind.clone())
+            .map(|w| w.sync_kind.clone())
             .unwrap_or_default()
     };
-    let status = |b: &str| {
+    let sync = |b: &str| {
         engine
             .worktrees
             .iter()
             .find(|w| w.branch == b)
-            .map(|w| w.status.clone())
+            .map(|w| w.sync.clone())
             .unwrap_or_default()
     };
 
-    assert_eq!(status_kind("main"), "base");
-    assert_eq!(status_kind("merged-branch"), "merged");
-    assert_eq!(status_kind("squash-branch"), "squashed");
-    assert_eq!(status_kind("ahead-branch"), "ahead");
-    assert_eq!(status("ahead-branch"), "↑1");
-    assert!(engine.worktrees.iter().find(|w| w.branch == "main").unwrap().is_main);
+    assert_eq!(sync_kind("main"), "local");
+    assert_eq!(sync_kind("merged-branch"), "local");
+    assert_eq!(sync_kind("squash-branch"), "local");
+    assert_eq!(sync_kind("ahead-branch"), "local");
+    assert_eq!(sync("ahead-branch"), "local");
+    assert!(
+        engine
+            .worktrees
+            .iter()
+            .find(|w| w.branch == "main")
+            .unwrap()
+            .is_main
+    );
     assert_eq!(engine.worktrees.len(), 4);
     assert_eq!(engine.branches.len(), 1);
     assert_eq!(engine.branches[0].branch, "empty-pr");
@@ -229,25 +408,17 @@ echo "setting up {{ }}"
     assert_eq!(engine.branches[0].changes, "—");
 
     let picker = model::render_fzf_lines(&engine, false);
-    let worktrees_heading = picker.find("WORKTREES").unwrap();
-    let branches_heading = picker.find("BRANCHES").unwrap();
-    assert!(worktrees_heading < branches_heading);
-    assert!(picker[worktrees_heading..branches_heading].contains("ahead-branch"));
-    assert!(picker[branches_heading..].contains("empty-pr"));
+    let picker_header = render::render_picker_header(&herdr_worktrees::theme::ThemeColors::load());
+    assert!(picker_header.contains("WORKTREES"));
+    assert!(picker_header.contains("BRANCHES"));
+    assert!(!picker.contains("WORKTREES"));
+    assert!(!picker.contains("BRANCHES"));
+    assert_eq!(picker.lines().count(), 5);
+    assert!(picker.find("ahead-branch").unwrap() < picker.find("empty-pr").unwrap());
 
     // Newest worktree first; main checkout last.
     assert_eq!(engine.worktrees[0].branch, "ahead-branch");
     assert_eq!(engine.worktrees[engine.worktrees.len() - 1].branch, "main");
-
-    // Cache written for the three checked-out branches and one inactive branch.
-    let cache_files: Vec<String> = std::fs::read_dir(tmp.join("state").join("merge-status-v2"))
-        .map(|rd| {
-            rd.filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default();
-    assert_eq!(cache_files.len(), 4, "unexpected cache files: {cache_files:?}");
 
     std::fs::remove_dir_all(&tmp).ok();
 }
