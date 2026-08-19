@@ -55,6 +55,11 @@ fn pure_helpers() {
     assert_eq!(render::pad("abcdef", 3), "abc");
     assert_eq!(render::trunc("abcdef", 3), "abc");
     assert_eq!(render::trunc("ab", 5), "ab");
+    assert_eq!(
+        render::worktree_name("/tmp/worktrees/parser-fix"),
+        "parser-fix"
+    );
+    assert_eq!(render::worktree_name(""), "—");
 
     assert_eq!(apply_branch_prefix("foo", "kees/"), "kees/foo");
     assert_eq!(apply_branch_prefix("kees/foo", "kees/"), "kees/foo");
@@ -70,6 +75,8 @@ fn pure_helpers() {
 
     let h = render::render_header();
     assert!(h.contains("branch"));
+    assert!(h.contains("worktree"));
+    assert!(!render::render_header_with_options(false).contains("worktree"));
     assert!(h.contains("pr"));
     assert!(h.contains("review"));
     assert!(h.contains("conflict"));
@@ -273,6 +280,12 @@ echo "setting up {{ }}"
         "{{ repo_path }}/.wt/{{ branch | sanitize }}"
     );
     assert_eq!(config.open_mode(), "workspace");
+    assert!(config.show_worktree_name());
+    let hidden_names = Config {
+        show_worktree_name: Some(false),
+        ..Config::default()
+    };
+    assert!(!hidden_names.show_worktree_name());
     assert!(config.delete_branch());
     assert!(!config.force());
     assert_eq!(config.popup(), ("90%".to_string(), "70%".to_string()));
@@ -408,12 +421,12 @@ echo "setting up {{ }}"
     assert_eq!(engine.branches[0].changes, "—");
 
     let picker = model::render_fzf_lines(&engine, false);
-    let picker_header = render::render_picker_header(&herdr_worktrees::theme::ThemeColors::load());
-    assert!(picker_header.contains("WORKTREES"));
-    assert!(picker_header.contains("BRANCHES"));
+    let picker_header = render::render_picker_header();
+    assert_eq!(picker_header, render::render_header());
     assert!(!picker.contains("WORKTREES"));
     assert!(!picker.contains("BRANCHES"));
     assert_eq!(picker.lines().count(), 5);
+    assert!(picker.contains("wt-ahead"));
     assert!(picker.find("ahead-branch").unwrap() < picker.find("empty-pr").unwrap());
 
     // Newest worktree first; main checkout last.

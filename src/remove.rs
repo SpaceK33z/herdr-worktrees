@@ -147,7 +147,7 @@ pub fn run_interactive() -> Result<()> {
     let header = format!(
         "{}  {}",
         render::pad("safety", COL_SAFETY),
-        render::render_header()
+        render::render_header_with_options(config.show_worktree_name())
     );
     let footer = "tab select · shift-tab deselect · enter remove selected/current · ctrl-r recheck";
     if list.is_empty() {
@@ -224,7 +224,12 @@ fn render_remove_candidates(
         } else {
             render_checking()
         };
-        let row = render::render_row(&branch, &display, &engine.prefix);
+        let row = render::render_row_with_options(
+            &branch,
+            &display,
+            &engine.prefix,
+            engine.show_worktree_name,
+        );
         rows.push(format!("{branch}\t{}\t{safety}  {row}", worktree.path));
     }
     rows.join("\n")

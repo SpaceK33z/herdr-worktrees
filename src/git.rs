@@ -24,6 +24,30 @@ pub fn git_success(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Run `git` with inherited stdio so errors and progress reach the terminal.
+/// Used for explicit user actions (fetch, worktree add) where the user should
+/// see why something failed.
+pub fn git_inherit(args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .env("LC_ALL", "C")
+        .args(args)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The commit hash a ref points to, if the ref exists.
+pub fn ref_oid(repo: &str, refname: &str) -> Option<String> {
+    let oid = git_stdout(&["-C", repo, "rev-parse", "-q", "--verify", refname]);
+    let oid = oid.trim();
+    (!oid.is_empty()).then(|| oid.to_string())
+}
+
+/// Delete a ref (used to clean up temporary PR refs).
+pub fn delete_ref(repo: &str, refname: &str) -> bool {
+    git_success(&["-C", repo, "update-ref", "-d", refname])
+}
+
 /// The main working-tree path (the repo root), not the current worktree.
 pub fn repo_root() -> Result<PathBuf> {
     let cdir = git_stdout(&["rev-parse", "--path-format=absolute", "--git-common-dir"]);

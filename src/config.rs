@@ -18,6 +18,10 @@ pub struct Config {
     pub open_mode: Option<String>,
     #[serde(rename = "github-prs")]
     pub github_prs: Option<bool>,
+    #[serde(rename = "show-worktree-name")]
+    pub show_worktree_name: Option<bool>,
+    #[serde(rename = "pr-checkout")]
+    pub pr_checkout: Option<bool>,
     pub popup: Popup,
     pub remove: Remove,
     #[serde(rename = "pre-start")]
@@ -77,6 +81,14 @@ impl Config {
 
     pub fn github_prs(&self) -> bool {
         self.github_prs.unwrap_or(false)
+    }
+
+    pub fn show_worktree_name(&self) -> bool {
+        self.show_worktree_name.unwrap_or(true)
+    }
+
+    pub fn pr_checkout(&self) -> bool {
+        self.pr_checkout.unwrap_or(true)
     }
 
     pub fn delete_branch(&self) -> bool {

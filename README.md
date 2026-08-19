@@ -2,20 +2,20 @@
 
 A [Herdr](https://herdr.dev) plugin for switching, creating, and removing Git
 worktrees from a fuzzy popup. It lists checked-out worktrees, local branches,
-and remote-only `origin` branches with pull request, review, conflict, age,
-working tree, and push/pull state.
+and remote-only `origin` branches with worktree name, pull request, review,
+unresolved review threads, conflict, age, working tree, and push/pull state.
 
 ```text
-┌ worktrees ────────────────────────────────────────────────────────────────┐
-│ > kees/                                                         3/7       │
-│   WORKTREES    BRANCHES                                                  │
-│   branch            pr        review    conflict  when   changes  sync    │
-│ ▸ kees/parser-fix   #1234     approved           2h     +3 ~1     ↑2      │
-│   main              —         —                  4h     clean     ↓1      │
-│   kees/queue-retry  #1235     —                  1d     —         merged  │
-│   kees/old-spike    —         —                  3w     —         local   │
-│ enter switch/create · ctrl-n new · alt+enter base… · ctrl-p open PR      │
-└───────────────────────────────────────────────────────────────────────────┘
+┌ worktrees ──────────────────────────────────────────────────────────────────────────────────────────┐
+│ > kees/                                                         3/7                                 │
+│   WORKTREES    BRANCHES                                                                             │
+│   branch            worktree        pr        review    threads  conflict  when   changes  sync     │
+│ ▸ kees/parser-fix   parser-fix      #1234     approved  2                  2h     +3 ~1     ↑2      │
+│   main              herdr-worktrees —         —         —                  4h     clean     ↓1      │
+│   kees/queue-retry  —               #1235     —         —                  1d     —         merged  │
+│   kees/old-spike    —               —         —         —                  3w     —         local   │
+│ enter switch/create · ctrl-n new · alt+enter base… · ctrl-p open PR · GitHub: now                   │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Requirements
@@ -72,8 +72,8 @@ Press `prefix+w` in a Git workspace to open the picker.
 | Key | Action |
 | --- | --- |
 | `prefix+w` | Open the worktree picker. |
-| `enter` | Switch to the highlighted worktree, create a worktree for the highlighted local or remote-only branch, or create the typed branch when nothing matches. |
-| `ctrl-n` | Create the typed branch even when a fuzzy match is highlighted. |
+| `enter` | Run the highlighted action: switch worktrees, check out a local or remote-only branch, check out a pull request, or create the exact typed query from its create row. |
+| `ctrl-n` | Create the exact typed query directly (shortcut for the create row). |
 | `alt+enter` | Choose a custom base branch, then create. |
 | `prefix+shift+w` | Open the picker in custom-base mode. |
 | `prefix+d` | Open the removal picker. |
@@ -93,16 +93,26 @@ to it. Selecting a local branch creates a worktree for it. Selecting a remote ro
 creates local `<branch>` with `origin/<branch>` as its explicit upstream, uses the
 normal local-branch worktree path, opens it in Herdr, and runs the configured
 setup flow. Remote rows are checkout candidates only and are never added to the
-removal picker. Section markers and branch names follow the active Herdr theme,
-including `[theme.custom]` overrides.
+removal picker. As soon as the query is nonempty, a bold, theme-colored
+**create worktree** row appears last, below the fuzzy-ranked real matches, for
+that exact text. Typing a pull-request reference (`123`, `#123`, or `pr:123`)
+instead shows a **checkout pull request** row first, above the matches, so
+pressing `enter` on a bare number is deterministic. Branch names stay neutral
+so the active Herdr palette does not assign arbitrary semantic colors to
+worktrees and branches.
 
 The picker draws batched local and `origin` ref metadata first and updates the
 list after working tree, sync, and GitHub checks finish. Local rows remain first;
 remote discovery does not start one Git process per row. A `…` in **changes** or
 **sync** means the background scan is still running.
 
+- **worktree**: Final directory name for a checked-out worktree. Branch rows show `—`.
+  Set `show-worktree-name = false` to hide this column.
 - **pr**: Pull request number. Ctrl-click the link or press `ctrl-p` to open it.
 - **review**: `approved`, `changes`, `review`, or `draft`.
+- **threads**: Number of unresolved GitHub review threads. `0` means all threads
+  are resolved, `?` means the thread lookup failed, and `N+` means the pull
+  request has more than 100 review threads.
 - **conflict**: `conflict` when an open pull request has merge conflicts.
 - **when**: Age of the branch's latest commit.
 - **changes**: `+staged ~unstaged` or `clean`. The list skips untracked files for
@@ -119,15 +129,16 @@ remote discovery does not start one Git process per row. A `…` in **changes** 
   - `merged`: GitHub reports a merged pull request at the branch's current commit
 
 Pull request columns and the `merged` state require `github-prs = true`, a
-GitHub remote, and an authenticated `gh` CLI. The lookup has a 1.5-second
-timeout and is cached for 60 seconds. Pull counts use local remote-tracking
-refs; run `git fetch` when you need current remote state.
+GitHub remote, and an authenticated `gh` CLI. GitHub results are cached for 60
+seconds. The dim footer timestamp shows when GitHub data was last fetched;
+`ctrl-r` updates it after a successful refresh. Pull counts use local
+remote-tracking refs; run `git fetch` when you need current remote state.
 
 ## Creating a worktree
 
-Type a branch name that matches no existing entry and press `enter`. If a fuzzy
-match remains highlighted, press `ctrl-n` to create the typed branch instead.
-The plugin then:
+Type a branch name and select the **create worktree** row to create that exact
+query even when existing entries fuzzy-match it. `ctrl-n` remains a direct
+shortcut for the same operation. The plugin then:
 
 1. Applies `branch-prefix` and resolves `worktree-path`.
 2. Runs `git worktree add` from the configured base, the remote HEAD, `main` or
@@ -160,6 +171,29 @@ branch-prefix = "u/{{ user }}/"
 - Filtering ignores the prefix, so `parser` still matches `kees/parser-fix`.
 - `worktree-path` can use `{{ branch }}` or the unprefixed
   `{{ branch_short }}`.
+
+## Checking out a pull request
+
+Type a pull-request reference — `123`, `#123`, or `pr:123` — and press `enter`
+to check out that PR into a worktree. The plugin resolves the PR's real head
+branch with `gh pr view` and never applies `branch-prefix` to it. If the branch
+already has a worktree, it switches to it; otherwise it fetches the branch and
+creates a worktree at the normal configured path, then opens it in Herdr and
+runs the setup flow.
+
+- A same-repository PR fetches `origin/<branch>` and creates a tracking worktree
+  from it, so `git push` and the sync column work normally. An existing local
+  branch is reused as-is.
+- A fork PR fetches `refs/pull/N/head` into a temporary ref and creates a local
+  branch from it. You are asked to confirm first, because the checkout runs the
+  setup script against code you may not have reviewed. The branch is left
+  without an upstream; pushing to a fork is not configured automatically.
+- If a fork's branch name collides with a divergent local branch, the plugin
+  stops with an error rather than overwriting it.
+
+This works independently of `github-prs` (which only controls the background PR
+columns). Set `pr-checkout = false` to disable the feature entirely, so a bare
+number is treated as a literal branch name again.
 
 ## Removing worktrees
 
@@ -197,7 +231,9 @@ worktree-path = "{{ repo_path }}/.worktrees/{{ branch | sanitize }}"
 base-branch = "main"          # fallback: remote HEAD, main/master, current branch
 branch-prefix = ""            # for example, "kees/"
 open-mode = "workspace"       # "workspace" or "tab"
-github-prs = false            # PR, review, conflict, and merged state
+github-prs = false            # PR, review threads, conflict, and merged state
+pr-checkout = true            # checkout a PR by typing its number
+show-worktree-name = true     # show the worktree directory name column
 
 [popup]
 width = "90%"

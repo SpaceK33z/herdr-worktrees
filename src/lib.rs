@@ -25,6 +25,9 @@ pub fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("open") => open::run(&args[1..]),
         Some("picker") => picker::run(&args[1..]),
+        Some("picker-cache-list") => picker::run_cached_list(&args[1..]),
+        Some("picker-cache-refresh") => picker::run_cache_refresh(&args[1..]),
+        Some("picker-footer") => picker::run_footer(&args[1..]),
         Some("remover") => remove::run_interactive(),
         Some("remove-list") => remove::run_list(&args[1..]),
         Some("remove") => remove::run_target(&args[1..]),

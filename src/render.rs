@@ -1,11 +1,13 @@
 //! Column layout and display rendering for the fzf list.
 
 use crate::model::Worktree;
-use crate::theme::{AnsiColor, ThemeColors};
+use std::path::Path;
 
 pub const COL_BRANCH: usize = 32;
+pub const COL_WORKTREE: usize = 24;
 pub const COL_PR: usize = 8;
 pub const COL_REVIEW: usize = 8;
+pub const COL_THREADS: usize = 8;
 pub const COL_CONFLICT: usize = 8;
 pub const COL_WHEN: usize = 6;
 pub const COL_CHANGES: usize = 10;
@@ -66,39 +68,72 @@ pub fn sync_colored(s: &str, kind: &str) -> String {
     format!("\x1b[{color}m{s}\x1b[0m")
 }
 
-/// One display line: branch, PR, review, conflict, when, changes, sync.
-pub fn render_row(branch_disp: &str, wt: &Worktree, prefix: &str) -> String {
-    let branch = branch_cell(branch_disp, COL_BRANCH, prefix);
-    render_cells(branch, wt)
+/// The final path component used as the worktree's display name.
+pub fn worktree_name(path: &str) -> String {
+    if path.is_empty() {
+        return "—".to_string();
+    }
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| path.to_string())
 }
 
-pub fn render_picker_row(
+/// One display line: branch, optional worktree name, PR, review, unresolved threads, conflict, when, changes, sync.
+pub fn render_row(branch_disp: &str, wt: &Worktree, prefix: &str) -> String {
+    render_row_with_options(branch_disp, wt, prefix, true)
+}
+
+pub fn render_row_with_options(
     branch_disp: &str,
     wt: &Worktree,
     prefix: &str,
-    color: &AnsiColor,
+    show_worktree_name: bool,
 ) -> String {
-    let branch = color.paint(&branch_cell(branch_disp, COL_BRANCH, prefix));
-    render_cells(branch, wt)
+    let branch = branch_cell(branch_disp, COL_BRANCH, prefix);
+    render_cells(branch, wt, show_worktree_name)
 }
 
-pub fn render_picker_header(colors: &ThemeColors) -> String {
-    format!(
-        "{}    {}\n{}",
-        colors.worktrees.paint_bold("WORKTREES"),
-        colors.branches.paint_bold("BRANCHES"),
-        render_header()
-    )
+pub fn render_picker_row(branch_disp: &str, wt: &Worktree, prefix: &str) -> String {
+    render_picker_row_with_options(branch_disp, wt, prefix, true)
 }
 
-fn render_cells(branch: String, wt: &Worktree) -> String {
+pub fn render_picker_row_with_options(
+    branch_disp: &str,
+    wt: &Worktree,
+    prefix: &str,
+    show_worktree_name: bool,
+) -> String {
+    let branch = branch_cell(branch_disp, COL_BRANCH, prefix);
+    render_cells(branch, wt, show_worktree_name)
+}
+
+pub fn render_picker_header() -> String {
+    render_picker_header_with_options(true)
+}
+
+pub fn render_picker_header_with_options(show_worktree_name: bool) -> String {
+    render_header_with_options(show_worktree_name)
+}
+
+fn render_cells(branch: String, wt: &Worktree, show_worktree_name: bool) -> String {
+    let worktree = show_worktree_name.then(|| pad(&worktree_name(&wt.path), COL_WORKTREE));
     let pr = pr_cell(wt.pr_number, wt.pr_url.as_deref(), COL_PR);
     let review = review_cell(&wt.review, COL_REVIEW);
+    let threads = threads_cell(&wt.threads, COL_THREADS);
     let conflict = conflict_cell(wt.conflict, COL_CONFLICT);
     let when = pad(&wt.when, COL_WHEN);
     let changes = pad(&wt.changes, COL_CHANGES);
     let sync = sync_colored(&trunc(&wt.sync, COL_SYNC), &wt.sync_kind);
-    format!("{branch}  {pr}  {review}  {conflict}  {when}  {changes}  {sync}")
+    match worktree {
+        Some(worktree) => {
+            format!("{branch}  {worktree}  {pr}  {review}  {threads}  {conflict}  {when}  {changes}  {sync}")
+        }
+        None => {
+            format!("{branch}  {pr}  {review}  {threads}  {conflict}  {when}  {changes}  {sync}")
+        }
+    }
 }
 
 /// PR number as an OSC 8 clickable link (opens on ctrl-click).
@@ -132,6 +167,19 @@ fn review_cell(review: &str, width: usize) -> String {
     cell
 }
 
+fn threads_cell(threads: &str, width: usize) -> String {
+    let color = match threads {
+        "0" => "32",
+        "?" | "—" => "2",
+        _ => "31",
+    };
+    let plain = trunc(threads, width);
+    let len = plain.chars().count();
+    let mut cell = format!("\x1b[{color}m{plain}\x1b[0m");
+    cell.push_str(&" ".repeat(width.saturating_sub(len)));
+    cell
+}
+
 /// A red `conflict` marker only when the PR has merge conflicts; blank otherwise.
 fn conflict_cell(conflict: bool, width: usize) -> String {
     if conflict {
@@ -145,16 +193,36 @@ fn conflict_cell(conflict: bool, width: usize) -> String {
 
 /// Column labels aligned to `render_row` (fzf reserves the pointer column).
 pub fn render_header() -> String {
-    format!(
-        "{}  {}  {}  {}  {}  {}  {}",
-        pad("branch", COL_BRANCH),
-        pad("pr", COL_PR),
-        pad("review", COL_REVIEW),
-        pad("conflict", COL_CONFLICT),
-        pad("when", COL_WHEN),
-        pad("changes", COL_CHANGES),
-        "sync"
-    )
+    render_header_with_options(true)
+}
+
+pub fn render_header_with_options(show_worktree_name: bool) -> String {
+    let worktree = show_worktree_name.then(|| pad("worktree", COL_WORKTREE));
+    match worktree {
+        Some(worktree) => format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
+            pad("branch", COL_BRANCH),
+            worktree,
+            pad("pr", COL_PR),
+            pad("review", COL_REVIEW),
+            pad("threads", COL_THREADS),
+            pad("conflict", COL_CONFLICT),
+            pad("when", COL_WHEN),
+            pad("changes", COL_CHANGES),
+            "sync"
+        ),
+        None => format!(
+            "{}  {}  {}  {}  {}  {}  {}  {}",
+            pad("branch", COL_BRANCH),
+            pad("pr", COL_PR),
+            pad("review", COL_REVIEW),
+            pad("threads", COL_THREADS),
+            pad("conflict", COL_CONFLICT),
+            pad("when", COL_WHEN),
+            pad("changes", COL_CHANGES),
+            "sync"
+        ),
+    }
 }
 
 /// Compact age: now, 5m, 2h, 1d, 3w, 2mo, 1y.

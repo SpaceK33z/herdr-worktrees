@@ -33,6 +33,7 @@ pub struct Worktree {
     pub pr_number: Option<u32>,
     pub pr_url: Option<String>,
     pub review: String,
+    pub threads: String,
     pub conflict: bool,
     pub created_ts: f64,
 }
@@ -45,6 +46,10 @@ pub struct Engine {
     pub base_short: String,
     #[serde(skip)]
     pub prefix: String,
+    #[serde(skip)]
+    pub show_worktree_name: bool,
+    #[serde(skip)]
+    pub github_prs: bool,
     pub worktrees: Vec<Worktree>,
     /// Local branches that are not currently checked out in a worktree.
     pub branches: Vec<Worktree>,
@@ -88,6 +93,7 @@ struct RefSnapshot {
 struct ComputeOptions {
     inspect_worktrees: bool,
     fetch_prs: bool,
+    use_pr_cache: bool,
     exact_sync: bool,
     include_branches: bool,
 }
@@ -96,24 +102,28 @@ impl ComputeOptions {
     const FULL: Self = Self {
         inspect_worktrees: true,
         fetch_prs: true,
+        use_pr_cache: true,
         exact_sync: true,
         include_branches: true,
     };
     const PICKER_INITIAL: Self = Self {
         inspect_worktrees: false,
         fetch_prs: false,
+        use_pr_cache: true,
         exact_sync: false,
         include_branches: true,
     };
     const REMOVE_INITIAL: Self = Self {
         inspect_worktrees: false,
         fetch_prs: false,
+        use_pr_cache: true,
         exact_sync: false,
         include_branches: false,
     };
     const REMOVE_SNAPSHOT: Self = Self {
         inspect_worktrees: false,
         fetch_prs: false,
+        use_pr_cache: true,
         exact_sync: true,
         include_branches: false,
     };
@@ -143,8 +153,10 @@ pub(crate) fn parse_worktree_list(porcelain: &str) -> Vec<RawWorktree> {
 }
 
 /// Compute the full engine for `repo`: every worktree, newest first.
-pub fn compute_all(repo: &str, config: &Config, state_dir: &Path, _use_cache: bool) -> Engine {
-    compute(repo, config, state_dir, ComputeOptions::FULL)
+pub fn compute_all(repo: &str, config: &Config, state_dir: &Path, use_cache: bool) -> Engine {
+    let mut options = ComputeOptions::FULL;
+    options.use_pr_cache = use_cache;
+    compute(repo, config, state_dir, options)
 }
 
 /// Compute the local metadata needed to draw the first picker frame.
@@ -178,7 +190,8 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let fetch_prs = options.fetch_prs && config.github_prs() && git::has_github_remote(repo);
+    let github_prs = config.github_prs() && git::has_github_remote(repo);
+    let fetch_prs = options.fetch_prs && github_prs;
 
     let checked_out: std::collections::HashSet<&str> = records
         .iter()
@@ -224,8 +237,9 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
     let pr_handle = if fetch_prs {
         let repo = repo.to_string();
         let state_dir = state_dir.to_path_buf();
+        let use_cache = options.use_pr_cache;
         Some(std::thread::spawn(move || {
-            pr::fetch_many(&pr_heads, &repo, &state_dir)
+            pr::fetch_many(&pr_heads, &repo, &state_dir, use_cache)
         }))
     } else {
         None
@@ -339,6 +353,8 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
         base,
         base_short,
         prefix,
+        show_worktree_name: config.show_worktree_name(),
+        github_prs,
         worktrees,
         branches,
         remote_branches,
@@ -530,6 +546,7 @@ fn compute_one(
         pr_number: None,
         pr_url: None,
         review: "—".to_string(),
+        threads: "—".to_string(),
         conflict: false,
         created_ts,
     }
@@ -561,6 +578,7 @@ fn compute_remote_candidate(
         pr_number: None,
         pr_url: None,
         review: "—".to_string(),
+        threads: "—".to_string(),
         conflict: false,
         created_ts: 0.0,
     }
@@ -603,6 +621,7 @@ fn apply_pr(worktree: &mut Worktree, pr: Option<&PrInfo>) {
     worktree.pr_number = pr.and_then(|pr| pr.number);
     worktree.pr_url = pr.and_then(|pr| pr.url.clone());
     worktree.review = review_display(pr);
+    worktree.threads = threads_display(pr);
     worktree.conflict = pr.map(|pr| pr.conflict).unwrap_or(false);
     if pr.is_some_and(|pr| pr.merged && pr.head_oid.as_deref() == Some(worktree.head.as_str())) {
         worktree.sync = "merged".to_string();
@@ -621,6 +640,17 @@ fn review_display(pr: Option<&PrInfo>) -> String {
             Some("CHANGES_REQUESTED") => "changes".to_string(),
             _ => "review".to_string(),
         },
+    }
+}
+
+fn threads_display(pr: Option<&PrInfo>) -> String {
+    let Some(pr) = pr.filter(|pr| pr.has_pr() && !pr.merged) else {
+        return "—".to_string();
+    };
+    match pr.unresolved_threads {
+        Some(count) if pr.threads_truncated => format!("{count}+"),
+        Some(count) => count.to_string(),
+        None => "?".to_string(),
     }
 }
 
@@ -728,25 +758,28 @@ pub fn fzf_line_index(list: &str, path: &str) -> Option<usize> {
 ///
 /// Fields are branch, path, entry kind, sync kind, changes, and display.
 pub fn render_fzf_lines(engine: &Engine, skip_detached: bool) -> String {
-    let colors = crate::theme::ThemeColors::load();
-    render_fzf_lines_with_colors(engine, skip_detached, &colors)
-}
-
-pub(crate) fn render_fzf_lines_with_colors(
-    engine: &Engine,
-    skip_detached: bool,
-    colors: &crate::theme::ThemeColors,
-) -> String {
     let row_count = engine.worktrees.len() + engine.branches.len() + engine.remote_branches.len();
     let mut out = String::with_capacity(row_count * 192);
     for wt in &engine.worktrees {
         if wt.detached && skip_detached {
             continue;
         }
-        push_fzf_row(&mut out, wt, "worktree", &engine.prefix, &colors.worktrees);
+        push_fzf_row(
+            &mut out,
+            wt,
+            "worktree",
+            &engine.prefix,
+            engine.show_worktree_name,
+        );
     }
     for branch in &engine.branches {
-        push_fzf_row(&mut out, branch, "branch", &engine.prefix, &colors.branches);
+        push_fzf_row(
+            &mut out,
+            branch,
+            "branch",
+            &engine.prefix,
+            engine.show_worktree_name,
+        );
     }
     let remote_prefix = (!engine.prefix.is_empty()).then(|| format!("origin/{}", engine.prefix));
     for branch in &engine.remote_branches {
@@ -755,7 +788,7 @@ pub(crate) fn render_fzf_lines_with_colors(
             branch,
             "remote",
             remote_prefix.as_deref().unwrap_or_default(),
-            &colors.branches,
+            engine.show_worktree_name,
         );
     }
     out
@@ -766,14 +799,14 @@ fn push_fzf_row(
     wt: &Worktree,
     entry_kind: &str,
     prefix: &str,
-    color: &crate::theme::AnsiColor,
+    show_worktree_name: bool,
 ) {
     let branch_disp = if wt.branch.is_empty() {
         "(detached)"
     } else {
         &wt.branch
     };
-    let row = render::render_picker_row(branch_disp, wt, prefix, color);
+    let row = render::render_picker_row_with_options(branch_disp, wt, prefix, show_worktree_name);
     writeln!(
         out,
         "{branch_disp}\t{}\t{entry_kind}\t{}\t{}\t{row}",
@@ -800,13 +833,16 @@ pub fn run_engine(args: &[String]) -> Result<()> {
         }
     }
 
+    let config = Config::load()?;
     if format == "header" {
-        println!("{}", render::render_header());
+        println!(
+            "{}",
+            render::render_header_with_options(config.show_worktree_name())
+        );
         return Ok(());
     }
 
     let repo = git::repo_root()?.to_string_lossy().into_owned();
-    let config = Config::load()?;
     let state_dir = state_dir();
     let engine = if fast {
         compute_picker_initial(&repo, &config, &state_dir)
