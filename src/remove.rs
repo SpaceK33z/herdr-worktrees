@@ -333,7 +333,8 @@ fn inspect_targets(
 fn inspect_candidate(worktree: &model::Worktree, config: &Config) -> Result<RemovalInspection> {
     let changes = inspect_changes(&worktree.path)?;
     let detached = worktree.branch.is_empty();
-    let unpublished = config.delete_branch() && !detached && sync_has_unpublished(worktree.sync_kind);
+    let unpublished =
+        config.delete_branch() && !detached && sync_has_unpublished(worktree.sync_kind);
     Ok(RemovalInspection {
         prepared: PreparedRemoval {
             branch: branch_name(worktree),
@@ -405,9 +406,9 @@ fn delete_worktrees(targets: &[RemovalTarget], config: &Config, repo: &str) -> R
         .iter()
         .filter_map(|target| target.authorized_risk)
         .collect();
-    let require_force = !risks.is_empty() && !config.force();
-    let prompt = removal_prompt(targets, &risks, require_force);
-    if !tty::confirm(&prompt, require_force) {
+    let warn = !risks.is_empty() && !config.force();
+    let prompt = removal_prompt(targets, &risks, warn);
+    if !tty::confirm(&prompt) {
         return Ok(());
     }
 
@@ -515,21 +516,21 @@ fn render_checking() -> String {
     format!("\x1b[33m{}\x1b[0m", render::pad("… checking", COL_SAFETY))
 }
 
-fn removal_prompt(targets: &[RemovalTarget], risks: &[RemovalRisk], require_force: bool) -> String {
+fn removal_prompt(targets: &[RemovalTarget], risks: &[RemovalRisk], warn: bool) -> String {
     if targets.len() == 1 {
         let branch = &targets[0].branch;
-        if require_force {
+        if warn {
             return format!(
-                "  ⚠ '{branch}' has {} — ctrl-x to remove anyway, any other key to cancel",
+                "  ⚠ '{branch}' has {} — enter to remove anyway, any other key to cancel",
                 risks[0].description()
             );
         }
         return format!("  remove '{branch}'? enter to confirm, any other key to cancel");
     }
 
-    if require_force {
+    if warn {
         format!(
-            "  ⚠ {} of {} selected worktrees are not safe to remove — ctrl-x to remove all anyway, any other key to cancel",
+            "  ⚠ {} of {} selected worktrees are not safe to remove — enter to remove all anyway, any other key to cancel",
             risks.len(),
             targets.len()
         )

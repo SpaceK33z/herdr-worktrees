@@ -18,6 +18,13 @@ pub fn git_output(args: &[&str]) -> std::io::Result<Output> {
         .output()
 }
 
+/// Stdout of a `git` command, lossily decoded.
+///
+/// A command that fails to spawn, exits non-zero, or writes only to stderr all
+/// give the same empty string: callers use this for queries where "no output"
+/// and "no answer" mean the same thing (no refs, no worktrees, no config). When
+/// a failure has to be told apart from an empty result, use [`git_output`] or
+/// [`git_success`].
 pub fn git_stdout(args: &[&str]) -> String {
     git_output(args)
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())

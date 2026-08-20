@@ -177,7 +177,6 @@ mod tests {
         assert_eq!(guarded[8], Some(8));
     }
 
-
     #[test]
     fn normalizes_relative_segments() {
         let cases = [

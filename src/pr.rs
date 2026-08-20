@@ -602,11 +602,13 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_file, cache_store, cached_many, first_line, parse_gh, parse_gh_many, parse_pr_target,
-        parse_thread_counts, prune_stale_cache, refresh_file, refresh_status, repo_cache_dir,
-        run_with_timeout, store_last_refresh, store_refresh_failure, FetchPatience, GhError,
-        PrInfo, ThreadCount, CACHE_MAX_AGE, INTERACTIVE_LIST_TIMEOUT, LIST_TIMEOUT, PR_LIMIT,
+        cache_file, cache_store, cached_many, first_line, now_ms, parse_gh, parse_gh_many,
+        parse_pr_target, parse_thread_counts, prune_stale_cache, refresh_file, refresh_status,
+        repo_cache_dir, run_with_timeout, store_last_refresh, store_refresh_failure, CacheEntry,
+        FetchPatience, GhError, PrInfo, ThreadCount, CACHE_MAX_AGE, CACHE_TTL_MS,
+        INTERACTIVE_LIST_TIMEOUT, LIST_TIMEOUT, PR_LIMIT,
     };
+    use crate::util;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -885,6 +887,55 @@ mod tests {
         assert!(!found.contains_key("unknown"));
         // Entries belong to one repository only.
         assert!(cached_many(["stored"], "/repo/two", &state).is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Write a cache entry with a chosen age, which `cache_store` cannot do.
+    fn store_aged(state: &Path, repo: &str, branch: &str, age_ms: u128) {
+        let entry = CacheEntry {
+            ts: now_ms().saturating_sub(age_ms),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            info: PrInfo::default(),
+        };
+        util::write_json_atomic(&cache_file(state, repo, branch), &entry).unwrap();
+    }
+
+    /// The TTL is what makes a reopened picker refetch instead of showing PR
+    /// columns from an earlier session forever.
+    #[test]
+    fn a_cache_entry_stops_being_used_once_its_ttl_has_passed() {
+        let state = state_dir("ttl");
+        let repo = "/repo/one";
+
+        store_aged(&state, repo, "fresh", CACHE_TTL_MS / 2);
+        assert!(cached_many(["fresh"], repo, &state).contains_key("fresh"));
+
+        // Exactly one TTL old: time only moves on between writing and reading,
+        // so this entry is expired by the time it is looked up.
+        store_aged(&state, repo, "expired", CACHE_TTL_MS);
+        assert!(cached_many(["expired"], repo, &state).is_empty());
+
+        store_aged(&state, repo, "ancient", CACHE_TTL_MS.saturating_mul(100));
+        assert!(cached_many(["ancient"], repo, &state).is_empty());
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    /// Cache files are named by a hash of the branch, so the entry carries the
+    /// branch as well and a file that does not name it is ignored.
+    #[test]
+    fn a_cache_entry_naming_another_branch_is_not_used() {
+        let state = state_dir("branch");
+        let repo = "/repo/one";
+        let entry = CacheEntry {
+            ts: now_ms(),
+            repo: repo.to_string(),
+            branch: "other".to_string(),
+            info: PrInfo::default(),
+        };
+        util::write_json_atomic(&cache_file(&state, repo, "wanted"), &entry).unwrap();
+
+        assert!(cached_many(["wanted"], repo, &state).is_empty());
         let _ = std::fs::remove_dir_all(&state);
     }
 

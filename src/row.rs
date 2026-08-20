@@ -29,6 +29,8 @@ pub const KIND_BRANCH: &str = "branch";
 pub const KIND_REMOTE: &str = "remote";
 pub const KIND_CREATE: &str = "create";
 pub const KIND_PR: &str = "pr";
+/// A divider the picker skips rather than acts on.
+pub const KIND_SECTION: &str = "section";
 
 /// One picker row. The borrowed form keeps rendering allocation-free and lets
 /// the picker route a selection without copying its fields.

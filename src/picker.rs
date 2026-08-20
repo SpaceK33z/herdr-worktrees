@@ -8,10 +8,11 @@ use crate::model::{self, Engine};
 use crate::pr;
 use crate::remove;
 use crate::render;
+use crate::row::{self, PickerRow};
 use crate::setup;
 use crate::tty;
 use crate::util;
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -36,8 +37,8 @@ pub fn run(args: &[String]) -> Result<()> {
     let state_dir = model::state_dir();
     let cur_path = git::current_toplevel();
 
-    if dry_run && dry_name.is_some() {
-        return dry_run_name(&config, &repo, dry_name.as_deref().unwrap());
+    if let Some(name) = dry_name.as_deref().filter(|_| dry_run) {
+        return dry_run_name(&config, &repo, name);
     }
 
     let mut base_override: Option<String> = None;
@@ -48,6 +49,12 @@ pub fn run(args: &[String]) -> Result<()> {
             return Ok(());
         }
     }
+
+    let context = PickerContext {
+        config: &config,
+        repo: &repo,
+        dry_run,
+    };
 
     loop {
         let engine = model::compute_picker_initial(&repo, &config, &state_dir);
@@ -60,111 +67,145 @@ pub fn run(args: &[String]) -> Result<()> {
             return Ok(());
         }
 
-        // ctrl-p: open the selected branch's PR in the browser.
-        if fzf_out.key == "ctrl-p" {
-            if let Some(sel) = &fzf_out.selection {
-                let parts: Vec<&str> = sel.split('\t').collect();
-                if let Some(branch) = parts.first().filter(|branch| !branch.is_empty()) {
-                    let entry_kind = parts.get(2).copied().unwrap_or("");
-                    if !matches!(
-                        entry_route(entry_kind),
-                        EntryRoute::Create | EntryRoute::Section | EntryRoute::Unknown
-                    ) {
-                        open_pr_in_browser(branch, entry_kind, &repo);
-                    }
-                }
-            }
-            return Ok(());
+        let selection = fzf_out.selection.as_deref().map(PickerRow::parse_selection);
+        let query = fzf_out.query.as_str();
+        let base = base_override.as_deref().unwrap_or(&engine.base);
+        let outcome = match fzf_out.key.as_str() {
+            "ctrl-p" => open_selected_pr(selection, &repo),
+            "ctrl-d" => delete_selected(selection, &context),
+            "ctrl-n" => create_from_query(&context, query, base),
+            "alt-enter" => create_on_picked_base(
+                &context,
+                query,
+                base_override.as_deref(),
+                engine.base.as_str(),
+            ),
+            _ => route_selection(&context, selection, query, base),
+        };
+        match report(outcome) {
+            AfterAction::Redraw => continue,
+            AfterAction::Close => return Ok(()),
         }
-
-        // ctrl-d: delete the selected worktree, then refresh the picker in place.
-        if fzf_out.key == "ctrl-d" {
-            if let Some(sel) = &fzf_out.selection {
-                let parts: Vec<&str> = sel.split('\t').collect();
-                if parts.len() >= 2 {
-                    let del_branch = parts[0];
-                    let del_path = parts[1];
-                    let entry_kind = parts.get(2).copied().unwrap_or("");
-                    if entry_route(entry_kind) == EntryRoute::Worktree
-                        && !del_path.is_empty()
-                        && del_path != repo
-                    {
-                        let _ = remove::delete_worktree(del_branch, del_path, &config, &repo);
-                    }
-                }
-            }
-            continue;
-        }
-
-        // ctrl-n: create the typed query even when fzf highlights a fuzzy match.
-        if fzf_out.key == "ctrl-n" {
-            if fzf_out.query.is_empty() {
-                return Ok(());
-            }
-            let base = base_override.as_deref().unwrap_or(&engine.base);
-            create_worktree(&fzf_out.query, base, &config, &repo, dry_run, false);
-            return Ok(());
-        }
-
-        // alt-enter: always create (off the chosen/current base).
-        if fzf_out.key == "alt-enter" {
-            if fzf_out.query.is_empty() {
-                return Ok(());
-            }
-            let b = match &base_override {
-                Some(b) => b.clone(),
-                None => match pick_base(&repo, &engine.base) {
-                    Some(b) => b,
-                    None => return Ok(()),
-                },
-            };
-            create_worktree(&fzf_out.query, &b, &config, &repo, dry_run, false);
-            return Ok(());
-        }
-
-        if let Some(sel) = &fzf_out.selection {
-            let parts: Vec<&str> = sel.split('\t').collect();
-            if parts.len() >= 3 {
-                let sel_branch = parts[0].to_string();
-                let sel_path = parts[1].to_string();
-                match entry_route(parts[2]) {
-                    EntryRoute::Worktree => {
-                        switch_worktree(&sel_path, &sel_branch, &config, &repo, dry_run);
-                        return Ok(());
-                    }
-                    route @ (EntryRoute::Create | EntryRoute::LocalBranch) => {
-                        let Some((name, exact_branch)) =
-                            selected_creation_target(route, &fzf_out.query, &sel_branch)
-                        else {
-                            return Ok(());
-                        };
-                        let base = base_override.as_deref().unwrap_or(&engine.base);
-                        create_worktree(name, base, &config, &repo, dry_run, exact_branch);
-                        return Ok(());
-                    }
-                    EntryRoute::RemoteBranch => {
-                        checkout_remote_worktree(&sel_branch, &config, &repo, dry_run);
-                        return Ok(());
-                    }
-                    EntryRoute::PullRequest => {
-                        let Some(number) = parse_pr_query(&fzf_out.query) else {
-                            return Ok(());
-                        };
-                        checkout_pr_worktree(number, &config, &repo, dry_run);
-                        return Ok(());
-                    }
-                    EntryRoute::Section => continue,
-                    EntryRoute::Unknown => return Ok(()),
-                }
-            }
-        } else if !fzf_out.query.is_empty() {
-            let base = base_override.as_deref().unwrap_or(&engine.base);
-            create_worktree(&fzf_out.query, base, &config, &repo, dry_run, false);
-            return Ok(());
-        }
-
-        return Ok(());
     }
+}
+
+/// What every picker action needs to know: which repository it acts on, how new
+/// worktrees are named and opened, and whether this run only says what it would
+/// do.
+struct PickerContext<'a> {
+    config: &'a Config,
+    repo: &'a str,
+    dry_run: bool,
+}
+
+/// Whether the popup closes after an action, or redraws and stays open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterAction {
+    Close,
+    Redraw,
+}
+
+/// The one place that decides how a failed action looks: the actions themselves
+/// only report git's own output on the way past. A message the user cannot read
+/// is no message, so a failure holds the popup open until a key is pressed.
+fn report(outcome: Result<AfterAction>) -> AfterAction {
+    match outcome {
+        Ok(after) => after,
+        Err(error) => {
+            tty::err(&format!("{error:#}"));
+            tty::wait_key();
+            AfterAction::Close
+        }
+    }
+}
+
+/// ctrl-p: open the selected row's pull request in the browser.
+fn open_selected_pr(selection: Option<PickerRow>, repo: &str) -> Result<AfterAction> {
+    let Some(row) = selection.filter(|row| !row.branch.is_empty()) else {
+        return Ok(AfterAction::Close);
+    };
+    if !matches!(
+        entry_route(row.entry_kind),
+        EntryRoute::Create | EntryRoute::Section | EntryRoute::Unknown
+    ) {
+        open_pr_in_browser(row.branch, row.entry_kind, repo)?;
+    }
+    Ok(AfterAction::Close)
+}
+
+/// ctrl-d: delete the selected worktree, then redraw the picker in place.
+fn delete_selected(selection: Option<PickerRow>, context: &PickerContext) -> Result<AfterAction> {
+    if let Some(row) = selection.filter(|row| {
+        entry_route(row.entry_kind) == EntryRoute::Worktree
+            && !row.path.is_empty()
+            && row.path != context.repo
+    }) {
+        remove::delete_worktree(row.branch, row.path, context.config, context.repo)?;
+    }
+    Ok(AfterAction::Redraw)
+}
+
+/// ctrl-n: create the typed query even when fzf highlights a fuzzy match.
+fn create_from_query(context: &PickerContext, query: &str, base: &str) -> Result<AfterAction> {
+    if !query.is_empty() {
+        create_worktree(context, query, base, false)?;
+    }
+    Ok(AfterAction::Close)
+}
+
+/// alt-enter: always create, off a base branch picked for this run.
+fn create_on_picked_base(
+    context: &PickerContext,
+    query: &str,
+    base_override: Option<&str>,
+    default_base: &str,
+) -> Result<AfterAction> {
+    if query.is_empty() {
+        return Ok(AfterAction::Close);
+    }
+    let base = match base_override {
+        Some(base) => base.to_string(),
+        // Cancelling the base prompt cancels the creation.
+        None => match pick_base(context.repo, default_base) {
+            Some(base) => base,
+            None => return Ok(AfterAction::Close),
+        },
+    };
+    create_worktree(context, query, &base, false)?;
+    Ok(AfterAction::Close)
+}
+
+/// enter: act on the highlighted row — or create the query when nothing at all
+/// matched it.
+fn route_selection(
+    context: &PickerContext,
+    selection: Option<PickerRow>,
+    query: &str,
+    base: &str,
+) -> Result<AfterAction> {
+    let Some(row) = selection else {
+        if !query.is_empty() {
+            create_worktree(context, query, base, false)?;
+        }
+        return Ok(AfterAction::Close);
+    };
+    match entry_route(row.entry_kind) {
+        EntryRoute::Worktree => switch_worktree(context, row.path, row.branch)?,
+        route @ (EntryRoute::Create | EntryRoute::LocalBranch) => {
+            if let Some((name, exact_branch)) = selected_creation_target(route, query, row.branch) {
+                create_worktree(context, name, base, exact_branch)?;
+            }
+        }
+        EntryRoute::RemoteBranch => checkout_remote_worktree(context, row.branch)?,
+        EntryRoute::PullRequest => {
+            if let Some(number) = parse_pr_query(query) {
+                checkout_pr_worktree(context, number)?;
+            }
+        }
+        EntryRoute::Section => return Ok(AfterAction::Redraw),
+        EntryRoute::Unknown => {}
+    }
+    Ok(AfterAction::Close)
 }
 
 struct FzfOut {
@@ -186,12 +227,12 @@ enum EntryRoute {
 
 fn entry_route(kind: &str) -> EntryRoute {
     match kind {
-        "create" => EntryRoute::Create,
-        "pr" => EntryRoute::PullRequest,
-        "worktree" => EntryRoute::Worktree,
-        "branch" => EntryRoute::LocalBranch,
-        "remote" => EntryRoute::RemoteBranch,
-        "section" => EntryRoute::Section,
+        row::KIND_CREATE => EntryRoute::Create,
+        row::KIND_PR => EntryRoute::PullRequest,
+        row::KIND_WORKTREE => EntryRoute::Worktree,
+        row::KIND_BRANCH => EntryRoute::LocalBranch,
+        row::KIND_REMOTE => EntryRoute::RemoteBranch,
+        row::KIND_SECTION => EntryRoute::Section,
         _ => EntryRoute::Unknown,
     }
 }
@@ -224,7 +265,7 @@ fn selected_creation_target<'a>(
 
 const MAIN_FZF_SEARCH_ARGS: &[&str] = &["--disabled", "--no-tac"];
 const INTERNAL_FZF_FILTER_ARGS: &[&str] =
-    &["--no-extended", "--ansi", "--delimiter=\t", "--with-nth=6"];
+    &["--no-extended", "--ansi", row::DELIMITER, row::WITH_NTH];
 const PICKER_FOOTER: &str = "\x1b[2menter\x1b[0m switch/create · \x1b[2mctrl-n\x1b[0m new · \x1b[2malt-enter\x1b[0m base… · \x1b[2mctrl-p\x1b[0m open PR · \x1b[2mctrl-d\x1b[0m delete · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mctrl-f\x1b[0m fetch · \x1b[2mesc\x1b[0m close";
 
 fn picker_footer(github_prs: bool, status: pr::RefreshStatus) -> String {
@@ -313,9 +354,9 @@ fn run_fzf(engine: &Engine, cur_path: &str) -> Result<Option<FzfOut>> {
         .args([
             "--print-query",
             "--expect=ctrl-n,alt-enter,ctrl-p,ctrl-d",
-            "--delimiter=\t",
-            "--with-nth=6",
-            "--accept-nth=1,2,3,4,5",
+            row::DELIMITER,
+            row::WITH_NTH,
+            row::ACCEPT_NTH,
             "--prompt=❯ ",
             "--header",
             &header,
@@ -363,9 +404,7 @@ fn build_fzf_bind(list: &str, cur_path: &str, commands: &PickerCommands) -> Stri
     // ctrl-f.
     let load_action = match model::fzf_line_index(list, cur_path) {
         Some(idx) if !cur_path.is_empty() => {
-            format!(
-                "load:pos({idx})+unbind(load)+reload-sync({load})+transform-footer({footer})"
-            )
+            format!("load:pos({idx})+unbind(load)+reload-sync({load})+transform-footer({footer})")
         }
         _ => format!("load:unbind(load)+reload-sync({load})+transform-footer({footer})"),
     };
@@ -480,13 +519,6 @@ fn render_query_aware_list(
     Ok(append_create_row(out, query, colors))
 }
 
-fn six_field_row_key(row: &str) -> Option<&str> {
-    if row.bytes().filter(|byte| *byte == b'\t').count() != 5 {
-        return None;
-    }
-    row.rsplit_once('\t').map(|(key, _display)| key)
-}
-
 fn strip_terminal_sequences(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut plain = Vec::with_capacity(bytes.len());
@@ -534,19 +566,28 @@ fn strip_terminal_sequences(value: &str) -> String {
 fn restore_ranked_rows(cached: &str, filtered: &str) -> Result<String> {
     let mut originals =
         std::collections::HashMap::<&str, std::collections::VecDeque<(&str, String)>>::new();
-    for (index, row) in cached.lines().enumerate() {
-        let key = six_field_row_key(row)
-            .with_context(|| format!("cached picker row {} does not have six fields", index + 1))?;
+    for (index, line) in cached.lines().enumerate() {
+        let key = row::key_fields(line).with_context(|| {
+            format!(
+                "cached picker row {} does not have {} fields",
+                index + 1,
+                row::FIELD_COUNT
+            )
+        })?;
         originals
             .entry(key)
             .or_default()
-            .push_back((row, strip_terminal_sequences(row)));
+            .push_back((line, strip_terminal_sequences(line)));
     }
 
     let mut restored = String::with_capacity(filtered.len());
-    for (index, row) in filtered.lines().enumerate() {
-        let key = six_field_row_key(row).with_context(|| {
-            format!("filtered picker row {} does not have six fields", index + 1)
+    for (index, line) in filtered.lines().enumerate() {
+        let key = row::key_fields(line).with_context(|| {
+            format!(
+                "filtered picker row {} does not have {} fields",
+                index + 1,
+                row::FIELD_COUNT
+            )
         })?;
         let candidates = originals.get_mut(key).with_context(|| {
             format!(
@@ -556,7 +597,7 @@ fn restore_ranked_rows(cached: &str, filtered: &str) -> Result<String> {
         })?;
         let position = candidates
             .iter()
-            .position(|(_original, plain)| plain == row)
+            .position(|(_original, plain)| plain == line)
             .with_context(|| {
                 format!(
                     "filtered picker row {} did not match cached display text",
@@ -582,26 +623,21 @@ fn append_create_row(
     }
     let action = colors.worktrees.paint_bold("＋ create worktree");
     let display = format!("{query}  {action}");
-    filtered.push_str(query);
-    filtered.push_str("\t\tcreate\t\t\t");
-    filtered.push_str(&display);
-    filtered.push('\n');
+    PickerRow::action(query, row::KIND_CREATE, &display).write_line(&mut filtered);
     filtered
 }
 
 /// Prepend the checkout-PR action row. It comes first so typing a bare number
 /// and pressing Enter deterministically checks out the PR rather than landing
-/// on a fuzzy match. Field 0 is the decimal number so `ctrl-p` opens the PR.
+/// on a fuzzy match. The branch field is the decimal number so `ctrl-p` opens
+/// the PR.
 fn prepend_pr_row(list: String, number: u32, colors: &crate::theme::ThemeColors) -> String {
     let action = colors.worktrees.paint_bold("⇄ checkout pull request");
     let display = format!("#{number}  {action}");
-    let mut row = String::new();
-    row.push_str(&number.to_string());
-    row.push_str("\t\tpr\t\t\t");
-    row.push_str(&display);
-    row.push('\n');
-    row.push_str(&list);
-    row
+    let mut out = String::with_capacity(list.len() + display.len() + row::FIELD_COUNT);
+    PickerRow::action(&number.to_string(), row::KIND_PR, &display).write_line(&mut out);
+    out.push_str(&list);
+    out
 }
 
 fn atomic_replace_cache(path: &Path, contents: &str) -> Result<()> {
@@ -686,7 +722,7 @@ fn pr_head_name<'a>(branch: &'a str, entry_kind: &str) -> &'a str {
     }
 }
 
-fn open_pr_in_browser(branch: &str, entry_kind: &str, repo: &str) {
+fn open_pr_in_browser(branch: &str, entry_kind: &str, repo: &str) -> Result<()> {
     let head = pr_head_name(branch, entry_kind);
     let opened = std::process::Command::new("gh")
         .args(["pr", "view", head, "--web"])
@@ -694,9 +730,9 @@ fn open_pr_in_browser(branch: &str, entry_kind: &str, repo: &str) {
         .status()
         .is_ok_and(|status| status.success());
     if !opened {
-        tty::err(&format!("could not open a pull request for '{head}'"));
-        tty::wait_key();
+        bail!("could not open a pull request for '{head}'");
     }
+    Ok(())
 }
 
 fn pick_base(repo: &str, base: &str) -> Option<String> {
@@ -775,77 +811,66 @@ fn open_worktree(path: &str, branch: &str, config: &Config, repo: &str) -> Optio
     }
 }
 
-fn switch_worktree(path: &str, branch: &str, config: &Config, repo: &str, dry_run: bool) {
-    if dry_run {
+fn switch_worktree(context: &PickerContext, path: &str, branch: &str) -> Result<()> {
+    if context.dry_run {
         println!("switch to {branch} ({path})");
-        return;
+        return Ok(());
     }
-    match herdr::worktree_workspace_id(path, repo) {
+    match herdr::worktree_workspace_id(path, context.repo) {
         Some(ws) => herdr::run(&["workspace".into(), "focus".into(), ws]),
         None => {
-            let _ = open_worktree(path, branch, config, repo);
+            let _ = open_worktree(path, branch, context.config, context.repo);
         }
     }
+    Ok(())
 }
 
-fn checkout_remote_worktree(remote: &str, config: &Config, repo: &str, dry_run: bool) {
-    let Some(local_branch) = model::origin_local_branch(remote) else {
-        tty::err(&format!("invalid origin branch '{remote}'"));
-        tty::wait_key();
-        return;
-    };
+fn checkout_remote_worktree(context: &PickerContext, remote: &str) -> Result<()> {
+    let repo = context.repo;
+    let config = context.config;
+    let local_branch = model::origin_local_branch(remote)
+        .with_context(|| format!("invalid origin branch '{remote}'"))?;
     let user = git::resolve_user(repo);
     let prefix = config.resolved_prefix(&user);
     let short = branch_short_name(local_branch, &prefix);
     let path = config.render_worktree_path(local_branch, &short, remote, repo, &user);
 
-    if dry_run {
+    if context.dry_run {
         println!("checkout {remote} as {local_branch} at {path}");
-        return;
+        return Ok(());
     }
 
     // Re-check the local ref at selection time. If it appeared since the picker
     // was rendered, use it rather than trying to replace it.
     if git::ref_exists(repo, &format!("refs/heads/{local_branch}")) {
-        create_worktree(local_branch, remote, config, repo, false, true);
-        return;
+        return create_worktree(context, local_branch, remote, true);
     }
     if !git::ref_exists(repo, &format!("refs/remotes/{remote}")) {
-        tty::err(&format!("remote branch '{remote}' no longer exists"));
-        tty::wait_key();
-        return;
+        bail!("remote branch '{remote}' no longer exists");
     }
-    if !add_remote_tracking_worktree(repo, &path, local_branch, remote) {
-        return;
-    }
+    add_remote_tracking_worktree(repo, &path, local_branch, remote)?;
 
     open_and_setup_worktree(&path, local_branch, remote, repo, config);
+    Ok(())
 }
 
 /// Check out a GitHub pull request by number into a worktree.
-fn checkout_pr_worktree(number: u32, config: &Config, repo: &str, dry_run: bool) {
-    let target = match pr::resolve_pr_detailed(number, repo) {
-        Ok(target) => target,
-        Err(error) => {
-            tty::err(&format!(
-                "could not resolve pull request #{number}: {error}"
-            ));
-            tty::wait_key();
-            return;
-        }
-    };
+fn checkout_pr_worktree(context: &PickerContext, number: u32) -> Result<()> {
+    let repo = context.repo;
+    let config = context.config;
+    let target = pr::resolve_pr_detailed(number, repo)
+        .map_err(|error| anyhow!("could not resolve pull request #{number}: {error}"))?;
     let branch = target.head_ref.as_str();
 
     // Fast path: the PR's branch already has a worktree — just switch to it.
     if let Some(path) = find_worktree_path(repo, branch) {
-        switch_worktree(&path, branch, config, repo, dry_run);
-        return;
+        return switch_worktree(context, &path, branch);
     }
 
     // Fork PRs contain untrusted code and run the setup script in that
     // checkout; confirm before fetching.
     if target.is_cross_repo && !confirm_fork_checkout(number, branch) {
-        return;
+        return Ok(());
     }
 
     let user = git::resolve_user(repo);
@@ -858,21 +883,22 @@ fn checkout_pr_worktree(number: u32, config: &Config, repo: &str, dry_run: bool)
     };
     let path = config.render_worktree_path(branch, &short, &base, repo, &user);
 
-    if dry_run {
+    if context.dry_run {
         println!("checkout pull request #{number} ({branch}) at {path}");
-        return;
+        return Ok(());
     }
 
-    let ok = if target.is_cross_repo {
-        checkout_fork_pr(&target, number, &path, branch, repo)
+    let checked_out = if target.is_cross_repo {
+        checkout_fork_pr(&target, number, &path, branch, repo)?
     } else {
-        checkout_same_repo_pr(&target, &path, branch, repo)
+        checkout_same_repo_pr(&target, &path, branch, repo)?
     };
-    if !ok {
-        return;
+    if !checked_out {
+        return Ok(());
     }
 
     open_and_setup_worktree(&path, branch, &base, repo, config);
+    Ok(())
 }
 
 fn confirm_fork_checkout(number: u32, branch: &str) -> bool {
@@ -882,24 +908,32 @@ fn confirm_fork_checkout(number: u32, branch: &str) -> bool {
          checkout — only continue for PRs you trust.\n\n\
          press enter to confirm · esc to cancel"
     );
-    tty::confirm(&prompt, false)
+    tty::confirm(&prompt)
 }
+
+/// A step the user is asked to approve. `Ok(false)` means they declined, which
+/// is a cancellation rather than a failure to report.
+type Confirmed = Result<bool>;
 
 /// Same-repository PR: reuse an existing local branch, or fetch
 /// `origin/<branch>` and create a tracking worktree from it.
-fn checkout_same_repo_pr(target: &pr::PullRequestTarget, path: &str, branch: &str, repo: &str) -> bool {
+fn checkout_same_repo_pr(
+    target: &pr::PullRequestTarget,
+    path: &str,
+    branch: &str,
+    repo: &str,
+) -> Confirmed {
     if git::ref_exists(repo, &format!("refs/heads/{branch}")) {
-        if !reconcile_local_pr_branch(target, branch, repo) {
-            return false;
+        if !reconcile_local_pr_branch(target, branch, repo)? {
+            return Ok(false);
         }
-        return worktree_add(&["-C", repo, "worktree", "add", path, branch]);
+        worktree_add(&["-C", repo, "worktree", "add", path, branch])?;
+        return Ok(true);
     }
 
     let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
     if !git::git_inherit(&["-C", repo, "fetch", "origin", &refspec]) {
-        tty::err(&format!("could not fetch '{branch}' from origin"));
-        tty::wait_key();
-        return false;
+        bail!("could not fetch '{branch}' from origin");
     }
     worktree_add(&[
         "-C",
@@ -911,20 +945,25 @@ fn checkout_same_repo_pr(target: &pr::PullRequestTarget, path: &str, branch: &st
         "--track",
         path,
         &format!("origin/{branch}"),
-    ])
+    ])?;
+    Ok(true)
 }
 
 /// A local branch left over from an earlier checkout can sit behind the pull
 /// request's current head — checking it out as-is would silently present stale
 /// commits as the PR. Fast-forward it when the PR only moved ahead; refuse when
 /// the two have diverged, as the fork path does.
-fn reconcile_local_pr_branch(target: &pr::PullRequestTarget, branch: &str, repo: &str) -> bool {
+fn reconcile_local_pr_branch(
+    target: &pr::PullRequestTarget,
+    branch: &str,
+    repo: &str,
+) -> Confirmed {
     let local_ref = format!("refs/heads/{branch}");
     let Some(local_oid) = git::ref_oid(repo, &local_ref) else {
-        return true;
+        return Ok(true);
     };
     if local_oid == target.head_oid {
-        return true;
+        return Ok(true);
     }
 
     // The PR head may not be in this clone yet; the fetch also refreshes the
@@ -933,21 +972,17 @@ fn reconcile_local_pr_branch(target: &pr::PullRequestTarget, branch: &str, repo:
     if !git::git_inherit(&["-C", repo, "fetch", "origin", &refspec])
         || !git::ref_exists(repo, &format!("{}^{{commit}}", target.head_oid))
     {
-        tty::err(&format!(
+        bail!(
             "could not fetch pull request #{} ({branch}) from origin",
             target.number
-        ));
-        tty::wait_key();
-        return false;
+        );
     }
 
     if !is_ancestor(repo, &local_oid, &target.head_oid) {
-        tty::err(&format!(
+        bail!(
             "local branch '{branch}' has diverged from pull request #{}; not overwriting",
             target.number
-        ));
-        tty::wait_key();
-        return false;
+        );
     }
 
     let prompt = format!(
@@ -956,23 +991,36 @@ fn reconcile_local_pr_branch(target: &pr::PullRequestTarget, branch: &str, repo:
          press enter to confirm · esc to keep the local commits",
         target.number
     );
-    if !tty::confirm(&prompt, false) {
-        return false;
+    if !tty::confirm(&prompt) {
+        return Ok(false);
     }
     // The old value makes this a compare-and-swap: a concurrent update aborts
     // the fast-forward rather than discarding it.
-    git::git_inherit(&[
+    if !git::git_inherit(&[
         "-C",
         repo,
         "update-ref",
         &local_ref,
         &target.head_oid,
         &local_oid,
-    ])
+    ]) {
+        bail!(
+            "could not fast-forward '{branch}' to pull request #{}",
+            target.number
+        );
+    }
+    Ok(true)
 }
 
 fn is_ancestor(repo: &str, ancestor: &str, descendant: &str) -> bool {
-    git::git_success(&["-C", repo, "merge-base", "--is-ancestor", ancestor, descendant])
+    git::git_success(&[
+        "-C",
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        ancestor,
+        descendant,
+    ])
 }
 
 /// Fork PR: fetch `refs/pull/N/head` into a temporary ref, then create a local
@@ -984,15 +1032,11 @@ fn checkout_fork_pr(
     path: &str,
     branch: &str,
     repo: &str,
-) -> bool {
+) -> Confirmed {
     let temp_ref = format!("refs/herdr-worktrees/pr-{number}");
     let refspec = format!("refs/pull/{number}/head:{temp_ref}");
     if !git::git_inherit(&["-C", repo, "fetch", "origin", &refspec]) {
-        tty::err(&format!(
-            "could not fetch pull request #{number} from origin"
-        ));
-        tty::wait_key();
-        return false;
+        bail!("could not fetch pull request #{number} from origin");
     }
 
     let local_ref = format!("refs/heads/{branch}");
@@ -1000,33 +1044,31 @@ fn checkout_fork_pr(
         if git::ref_oid(repo, &local_ref).as_deref() == Some(target.head_oid.as_str()) {
             worktree_add(&["-C", repo, "worktree", "add", path, branch])
         } else {
-            tty::err(&format!(
+            Err(anyhow!(
                 "branch '{branch}' already exists locally at a different commit; not overwriting"
-            ));
-            tty::wait_key();
-            false
+            ))
         }
     } else {
         worktree_add(&["-C", repo, "worktree", "add", "-b", branch, path, &temp_ref])
     };
 
+    // The temporary ref goes regardless: it exists only for the `worktree add`
+    // above, so `?` must not skip past this.
     let _ = git::delete_ref(repo, &temp_ref);
-    result
+    result.map(|()| true)
 }
 
 /// `git worktree add` for an explicit user action: git's own diagnostics reach
-/// the pane (an existing path, a branch checked out elsewhere, a bad name), and
-/// a failure holds the popup open long enough to read them.
-fn worktree_add(args: &[&str]) -> bool {
-    if git::git_inherit(args) {
-        return true;
+/// the pane (an existing path, a branch checked out elsewhere, a bad name), so
+/// the error only has to say which step they belong to.
+fn worktree_add(args: &[&str]) -> Result<()> {
+    if !git::git_inherit(args) {
+        bail!("git worktree add failed — see the error above");
     }
-    tty::err("git worktree add failed — see the error above");
-    tty::wait_key();
-    false
+    Ok(())
 }
 
-fn add_remote_tracking_worktree(repo: &str, path: &str, local: &str, remote: &str) -> bool {
+fn add_remote_tracking_worktree(repo: &str, path: &str, local: &str, remote: &str) -> Result<()> {
     worktree_add(&[
         "-C", repo, "worktree", "add", "-b", local, "--track", path, remote,
     ])
@@ -1039,13 +1081,13 @@ fn valid_branch_name(repo: &str, name: &str) -> bool {
 }
 
 fn create_worktree(
+    context: &PickerContext,
     name: &str,
     base: &str,
-    config: &Config,
-    repo: &str,
-    dry_run: bool,
     exact_branch: bool,
-) {
+) -> Result<()> {
+    let repo = context.repo;
+    let config = context.config;
     let user = git::resolve_user(repo);
     let prefix = config.resolved_prefix(&user);
     let final_branch = if exact_branch {
@@ -1056,24 +1098,22 @@ fn create_worktree(
     let short = branch_short_name(&final_branch, &prefix);
     let path = config.render_worktree_path(&final_branch, &short, base, repo, &user);
 
-    if dry_run {
+    if context.dry_run {
         if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
             println!("checkout {final_branch} at {path}");
         } else {
             println!("create {final_branch} from {base} at {path}");
         }
-        return;
+        return Ok(());
     }
 
     if !valid_branch_name(repo, &final_branch) {
-        tty::err(&format!("'{final_branch}' is not a valid branch name"));
-        tty::wait_key();
-        return;
+        bail!("'{final_branch}' is not a valid branch name");
     }
 
     // Every `worktree add` runs with `-C repo`, so a relative `worktree-path`
     // template resolves against the repo root rather than the popup's cwd.
-    let added = if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
+    if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
         // branch exists but has no checkout yet -> check it out into a new worktree
         worktree_add(&[
             "-C",
@@ -1082,7 +1122,7 @@ fn create_worktree(
             "add",
             path.as_str(),
             final_branch.as_str(),
-        ])
+        ])?;
     } else {
         // Only a brand-new branch starts from `base`, so only that path needs
         // the base to be current.
@@ -1096,13 +1136,11 @@ fn create_worktree(
             "-b",
             final_branch.as_str(),
             base,
-        ])
-    };
-    if !added {
-        return;
+        ])?;
     }
 
     open_and_setup_worktree(&path, &final_branch, base, repo, config);
+    Ok(())
 }
 
 /// Refresh the base's remote-tracking ref so the new branch starts from the
@@ -1371,7 +1409,10 @@ mod tests {
                 failed: true,
             },
         );
-        assert!(failed.contains("GitHub: failed — check gh auth"), "{failed}");
+        assert!(
+            failed.contains("GitHub: failed — check gh auth"),
+            "{failed}"
+        );
         assert!(!failed.contains("ago"), "{failed}");
     }
 
@@ -1630,12 +1671,13 @@ mod tests {
         git(&repo, &["push", "-q", "origin", "feature"]);
         git(&repo, &["branch", "-D", "feature"]);
 
-        assert!(add_remote_tracking_worktree(
+        add_remote_tracking_worktree(
             repo.to_str().unwrap(),
             worktree.to_str().unwrap(),
             "feature",
             "origin/feature",
-        ));
+        )
+        .unwrap();
         assert_eq!(git(&repo, &["branch", "--show-current"]), "main");
         assert_eq!(git(&worktree, &["branch", "--show-current"]), "feature");
         assert_eq!(
