@@ -89,7 +89,7 @@ struct RefSnapshot {
     origin_head: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ComputeOptions {
     inspect_worktrees: bool,
     fetch_prs: bool,
@@ -120,15 +120,21 @@ impl ComputeOptions {
     };
     const REMOVE_INITIAL: Self = Self {
         inspect_worktrees: false,
+        // Cache-only, like the switch picker's first frame: the PR columns are
+        // as much a part of deciding what to delete as they are of deciding
+        // what to switch to, and the cache costs nothing to read.
         fetch_prs: false,
-        cached_prs: false,
+        cached_prs: true,
         use_pr_cache: true,
         exact_sync: false,
         include_branches: false,
     };
     const REMOVE_SNAPSHOT: Self = Self {
         inspect_worktrees: false,
-        fetch_prs: false,
+        // The reload this backs already scans every worktree for untracked
+        // files, so it is the right place to spend a `gh` call — and merged
+        // state is what makes a worktree safe to delete.
+        fetch_prs: true,
         cached_prs: false,
         use_pr_cache: true,
         exact_sync: true,
@@ -183,6 +189,42 @@ pub fn compute_remove_snapshot(repo: &str, config: &Config, state_dir: &Path) ->
     compute(repo, config, state_dir, ComputeOptions::REMOVE_SNAPSHOT)
 }
 
+/// The branches to ask GitHub about, in the order the fetch should spend its
+/// per-branch queries: checked-out branches first, then whatever else this
+/// frame draws. A worktree row is what both pickers are really about, and the
+/// remove picker draws nothing else — asking about every local branch there
+/// spends the budget on rows nobody sees.
+fn pr_heads(
+    records: &[RawWorktree],
+    branch_records: &[RawWorktree],
+    remote_records: &[(&String, &RefMetadata)],
+    refs: &RefSnapshot,
+    base_short: &str,
+) -> Vec<(String, String)> {
+    records
+        .iter()
+        .filter(|record| !record.branch.is_empty())
+        .map(|record| {
+            let head = refs
+                .local
+                .get(&record.branch)
+                .map_or(record.head.clone(), |metadata| metadata.head.clone());
+            (record.branch.clone(), head)
+        })
+        .chain(
+            branch_records
+                .iter()
+                .map(|record| (record.branch.clone(), record.head.clone())),
+        )
+        .chain(
+            remote_records
+                .iter()
+                .map(|(branch, metadata)| ((*branch).clone(), metadata.head.clone())),
+        )
+        .filter(|(branch, _)| branch.as_str() != base_short)
+        .collect()
+}
+
 fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOptions) -> Engine {
     let porcelain = git::git_stdout(&["-C", repo, "worktree", "list", "--porcelain"]);
     let records = parse_worktree_list(&porcelain);
@@ -228,17 +270,8 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
     };
 
     let cached_prs = options.cached_prs && github_prs;
-    let pr_heads: Vec<_> = if fetch_prs || cached_prs {
-        refs.local
-            .iter()
-            .map(|(branch, metadata)| (branch.clone(), metadata.head.clone()))
-            .chain(
-                remote_records
-                    .iter()
-                    .map(|(branch, metadata)| ((*branch).clone(), metadata.head.clone())),
-            )
-            .filter(|(branch, _)| branch.as_str() != base_short)
-            .collect()
+    let pr_heads = if fetch_prs || cached_prs {
+        pr_heads(&records, &branch_records, &remote_records, &refs, &base_short)
     } else {
         Vec::new()
     };
@@ -779,7 +812,87 @@ pub fn run_engine(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::status_counts;
+    use super::{pr_heads, status_counts, ComputeOptions, RawWorktree, RefMetadata, RefSnapshot};
+
+    fn raw(branch: &str, head: &str) -> RawWorktree {
+        RawWorktree {
+            path: format!("/wt/{branch}"),
+            head: head.to_string(),
+            branch: branch.to_string(),
+        }
+    }
+
+    /// The fetch spends a bounded number of per-branch queries from the front of
+    /// this list, so a checked-out branch must never queue behind the hundreds
+    /// of stale branches a long-lived repository accumulates — and the remove
+    /// picker, which draws worktrees only, must not ask about anything else.
+    #[test]
+    fn pr_heads_lead_with_the_checked_out_branches() {
+        let mut refs = RefSnapshot::default();
+        refs.local.insert(
+            "kees/fix".to_string(),
+            RefMetadata {
+                head: "fresh".to_string(),
+                ..RefMetadata::default()
+            },
+        );
+        let worktrees = [raw("kees/fix", "stale"), raw("", "detached")];
+        let branches = [raw("old", "old-head")];
+        let main = "main".to_string();
+        let main_meta = RefMetadata::default();
+        let remotes = [(&main, &main_meta)];
+
+        let full = pr_heads(&worktrees, &branches, &remotes, &refs, "main");
+        assert_eq!(
+            full,
+            vec![
+                // The ref, not the worktree's HEAD: a merged pull request is
+                // matched against where the branch points now.
+                ("kees/fix".to_string(), "fresh".to_string()),
+                ("old".to_string(), "old-head".to_string()),
+            ],
+            "detached worktrees have no branch to ask about, and the base branch is not a row"
+        );
+
+        let removable = pr_heads(&worktrees, &[], &[], &refs, "main");
+        assert_eq!(removable, vec![("kees/fix".to_string(), "fresh".to_string())]);
+    }
+
+    /// Both pickers answer the same questions about a branch — is there a PR,
+    /// was it merged — so neither may be left computing rows without the data
+    /// that fills those columns. The remove picker once did, which showed up as
+    /// permanently empty pr/review/threads and a sync that never said `merged`.
+    #[test]
+    fn every_picker_frame_asks_for_pr_data_one_way_or_the_other() {
+        for options in [
+            ComputeOptions::FULL,
+            ComputeOptions::PICKER_INITIAL,
+            ComputeOptions::REMOVE_INITIAL,
+            ComputeOptions::REMOVE_SNAPSHOT,
+        ] {
+            assert!(
+                options.fetch_prs || options.cached_prs,
+                "{options:?} renders PR columns it never fills"
+            );
+        }
+    }
+
+    /// The frames drawn before anything is on screen stay cache-only; fetching
+    /// belongs to the reloads that already do slow work behind a drawn list.
+    #[test]
+    fn first_frames_read_the_pr_cache_rather_than_calling_gh() {
+        for (options, may_fetch) in [
+            (ComputeOptions::PICKER_INITIAL, false),
+            (ComputeOptions::REMOVE_INITIAL, false),
+            (ComputeOptions::REMOVE_SNAPSHOT, true),
+            (ComputeOptions::FULL, true),
+        ] {
+            assert_eq!(
+                options.fetch_prs, may_fetch,
+                "{options:?} fetches at the wrong moment"
+            );
+        }
+    }
 
     #[test]
     fn counts_staged_unstaged_and_untracked_porcelain_codes() {

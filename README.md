@@ -139,6 +139,13 @@ data was last fetched, and reads `GitHub: failed` when the last fetch could not
 reach GitHub. Pull counts use local remote-tracking refs; press `ctrl-f` when
 you need current remote state.
 
+A refresh lists the repository's open and most recently merged pull requests,
+then asks about branches those listings did not cover one at a time, starting
+with the checked-out ones. In a repository with thousands of pull requests and
+hundreds of branches, a branch whose pull request was merged long ago may
+therefore take a few refreshes to fill in — every worktree row is covered on the
+first one.
+
 ## Creating a worktree
 
 Type a branch name and select the **create worktree** row to create that exact
@@ -452,7 +459,9 @@ herdr plugin log list --plugin worktrees --limit 20
 ```
 
 If pull request columns stay empty, run `gh auth status`, confirm the repository
-has a GitHub remote, and set `github-prs = true`. If push/pull counts look stale,
+has a GitHub remote, and set `github-prs = true`. If they stay empty only for
+branches whose pull request was merged a long time ago, press `ctrl-r`: those
+are filled in a bounded number of branches per refresh. If push/pull counts look stale,
 run `git fetch` in the repository.
 
 ## Development

@@ -16,6 +16,17 @@ Notable user-visible changes are recorded here. This project follows
   before creating a branch from it, so new work starts from the upstream tip. A
   failed or slow fetch falls back to the local copy instead of blocking.
 
+### Fixed
+
+- Pull request columns and the `merged` state stayed empty in repositories with
+  a long pull request history. The background refresh paged through every pull
+  request the repository ever had, which no timeout can wait out; it now lists
+  the open and most recently merged ones and asks about the branches those
+  listings miss one at a time, checked-out branches first.
+- The remove picker draws its pull request columns from the cache on the first
+  frame and refreshes them with the reload behind it, instead of leaving them
+  empty and never showing that a worktree's branch was merged.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added

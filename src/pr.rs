@@ -216,108 +216,237 @@ fn parse_pr_target(json: &str) -> Option<PullRequestTarget> {
 }
 
 const CACHE_TTL_MS: u128 = 60_000;
-const PR_LIMIT: usize = 1000;
+/// The two repository-wide listings every refresh runs: open pull requests
+/// (what is still actionable) and the most recently merged ones (what makes a
+/// worktree safe to delete). `mergeStateStatus` is asked for only where it is
+/// used — a conflicting open pull request — because GitHub computes mergeability
+/// per row and it roughly doubles the time a listing takes.
+const LISTINGS: [(&str, &str); 2] = [
+    (
+        "open",
+        "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid",
+    ),
+    (
+        "merged",
+        "id,number,url,state,isDraft,reviewDecision,headRefName,headRefOid",
+    ),
+];
+/// One page per listing. Paging is what costs time here: a busy repository
+/// answers a single page in about a second and its whole pull request history
+/// in half a minute — long past any timeout a picker refresh can wait out, which
+/// is why the listings stay shallow and the per-branch queries below fill in
+/// whatever they missed.
+const LISTING_LIMIT: usize = 100;
+/// Fields for a per-branch query. Only a handful of rows come back, so the
+/// expensive `mergeStateStatus` is affordable here.
+const BRANCH_FIELDS: &str =
+    "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid";
+/// Pull requests fetched per branch. Only the newest open one, or a merged one
+/// that still covers the branch head, is ever shown; a handful of rows is more
+/// than enough history to choose from.
+const BRANCH_PR_LIMIT: usize = 10;
+/// How many branches may get their own query in one refresh. Each costs a `gh`
+/// process, and a long-lived checkout can have hundreds of stale branches, so
+/// the budget goes to the branches the caller listed first — the checked-out
+/// ones the picker is really about.
+const TARGETED_BRANCHES: usize = 32;
+/// How many per-branch queries run at once.
+const PR_WORKERS: usize = 8;
 const THREAD_LIMIT: usize = 100;
 /// Cache files untouched for this long are deleted on the next refresh.
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const REFRESH_FILE: &str = "last-refresh.json";
 
-/// Fetch all requested branch PRs with one `gh` process and one API query.
-/// If every branch has a fresh cache entry, no process is started.
+/// A branch and the object id its local ref points at.
+type BranchHead = (String, String);
+
+/// Fetch the pull request for each requested branch. Branches already in the
+/// cache start no process at all.
+///
+/// Two shallow repository-wide listings answer most branches in one round trip
+/// each; whatever they miss — an older merged pull request, typically, which is
+/// exactly what says a worktree is finished with — is asked for one branch at a
+/// time. Listing the repository's entire pull request history instead would
+/// answer everything in one query, but on a busy repository it cannot be paged
+/// through inside any timeout a refresh can wait out, and the merged branches
+/// are the ones that then never appear.
 pub fn fetch_many(
-    branch_heads: &[(String, String)],
+    branch_heads: &[BranchHead],
     repo: &str,
     state_dir: &Path,
     use_cache: bool,
     patience: FetchPatience,
 ) -> HashMap<String, PrInfo> {
     let mut cached = HashMap::with_capacity(branch_heads.len());
-    let mut all_cached = use_cache;
-    for (branch, _) in branch_heads {
-        match cache_get(state_dir, repo, branch) {
-            Some(info) => {
-                cached.insert(branch.clone(), info);
+    let mut wanted: Vec<&BranchHead> = Vec::new();
+    for entry in branch_heads {
+        // A cached entry is read even when the caller asked for fresh data: it
+        // is what the row falls back to if this branch's query fails.
+        if let Some(info) = cache_get(state_dir, repo, &entry.0) {
+            cached.insert(entry.0.clone(), info);
+            if use_cache {
+                continue;
             }
-            None => all_cached = false,
         }
+        wanted.push(entry);
     }
-    if all_cached || branch_heads.is_empty() {
+    if wanted.is_empty() {
         return cached;
     }
 
-    let fetched = gh_fetch(repo, patience)
-        .and_then(|json| parse_gh_many(&json, branch_heads, true))
-        // Large repositories can make the all-history query exceed the picker's
-        // timeout. Fall back to the much cheaper open-only query so actionable
-        // PR numbers still appear. Missing branches are not cached because they
-        // may have a merged PR that this response cannot prove absent.
-        .or_else(|| {
-            gh_fetch_open(repo, patience).and_then(|json| parse_gh_many(&json, branch_heads, false))
-        });
-    let Some(mut fetched) = fetched else {
+    let (rows, mut failed) = fetch_listings(repo, patience);
+    let mut fresh = resolve_from_listings(&rows, &wanted);
+
+    let unresolved: Vec<&BranchHead> = wanted
+        .iter()
+        .copied()
+        .filter(|(branch, _)| !fresh.contains_key(branch))
+        .take(TARGETED_BRANCHES)
+        .collect();
+    let targeted = util::parallel_map(&unresolved, PR_WORKERS, |(branch, head)| {
+        fetch_branch(repo, branch, head, patience)
+    });
+    for ((branch, _), info) in unresolved.iter().zip(targeted) {
+        match info.flatten() {
+            Some(info) => {
+                fresh.insert(branch.clone(), info);
+            }
+            None => failed = true,
+        }
+    }
+
+    if fresh.is_empty() {
         // Empty PR columns otherwise look like "this repository has no pull
         // requests"; record the failure so the picker footer can say so.
-        store_refresh_failure(state_dir, repo);
+        if failed {
+            store_refresh_failure(state_dir, repo);
+        }
         return cached;
-    };
-    let node_ids: Vec<_> = fetched
+    }
+
+    let node_ids: Vec<_> = fresh
         .values()
         .filter(|info| info.has_pr() && !info.merged)
         .filter_map(|info| info.node_id.clone())
         .collect();
     if let Some(thread_counts) = gh_fetch_thread_counts(repo, &node_ids) {
-        for info in fetched.values_mut() {
+        for info in fresh.values_mut() {
             if let Some(count) = info.node_id.as_deref().and_then(|id| thread_counts.get(id)) {
                 info.unresolved_threads = Some(count.unresolved);
                 info.threads_truncated = count.truncated;
             }
         }
     }
-    store_last_refresh(state_dir, repo);
-    prune_stale_cache(state_dir, repo);
-    for (branch, info) in fetched {
+    if failed {
+        store_refresh_failure(state_dir, repo);
+    } else {
+        store_last_refresh(state_dir, repo);
+        prune_stale_cache(state_dir, repo);
+    }
+    for (branch, info) in fresh {
         cache_store(state_dir, repo, &branch, &info);
         cached.insert(branch, info);
     }
     cached
 }
 
-/// Run one repository-wide `gh pr list` with a hard timeout. A timed-out child
-/// is killed and reaped instead of lingering after the picker has moved on.
-fn gh_fetch(repo: &str, patience: FetchPatience) -> Option<String> {
-    gh_fetch_state(
+/// Run both repository-wide listings at once and return their rows, plus
+/// whether either one failed to answer.
+fn fetch_listings(repo: &str, patience: FetchPatience) -> (Vec<serde_json::Value>, bool) {
+    let mut rows = Vec::new();
+    let mut failed = false;
+    let listed = util::parallel_map(&LISTINGS, LISTINGS.len(), |(state, fields)| {
+        gh_fetch_listing(repo, state, fields, patience)
+    });
+    for listing in listed {
+        match listing.flatten() {
+            Some(mut listing) => rows.append(&mut listing),
+            None => failed = true,
+        }
+    }
+    (rows, failed)
+}
+
+/// Match listed pull requests to the branches we asked about. A branch with no
+/// row stays unresolved rather than being recorded as having none: the listings
+/// are capped, so absence from them proves nothing.
+fn resolve_from_listings(
+    rows: &[serde_json::Value],
+    wanted: &[&BranchHead],
+) -> HashMap<String, PrInfo> {
+    let mut by_branch: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
+    for row in rows {
+        if let Some(branch) = row.get("headRefName").and_then(|name| name.as_str()) {
+            by_branch.entry(branch).or_default().push(row);
+        }
+    }
+    wanted
+        .iter()
+        .filter_map(|(branch, head)| {
+            let candidates = by_branch.get(branch.as_str())?;
+            Some((branch.clone(), select_pr_candidate(candidates, head)?))
+        })
+        .collect()
+}
+
+/// One branch's pull request, or `None` when `gh` could not answer. "This
+/// branch has no pull request" is an answer, not a failure: it comes back as a
+/// default `PrInfo` so the cache stops asking again.
+fn fetch_branch(repo: &str, branch: &str, head: &str, patience: FetchPatience) -> Option<PrInfo> {
+    parse_branch_prs(&gh_fetch_branch(repo, branch, patience)?, head)
+}
+
+fn parse_branch_prs(json: &str, head: &str) -> Option<PrInfo> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let prs: Vec<_> = value.as_array()?.iter().collect();
+    Some(select_pr_candidate(&prs, head).unwrap_or_default())
+}
+
+/// Every pull request ever opened from `branch`, newest first.
+fn gh_fetch_branch(repo: &str, branch: &str, patience: FetchPatience) -> Option<String> {
+    let limit = BRANCH_PR_LIMIT.to_string();
+    gh_run(
         repo,
-        "all",
-        "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid",
+        &[
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--head",
+            branch,
+            "--json",
+            BRANCH_FIELDS,
+            "--limit",
+            &limit,
+        ],
         patience,
     )
 }
 
-fn gh_fetch_open(repo: &str, patience: FetchPatience) -> Option<String> {
-    gh_fetch_state(
-        repo,
-        "open",
-        "id,number,url,state,isDraft,reviewDecision,headRefName,headRefOid",
-        patience,
-    )
-}
-
-fn gh_fetch_state(
+fn gh_fetch_listing(
     repo: &str,
     state: &str,
     fields: &str,
     patience: FetchPatience,
-) -> Option<String> {
-    let limit = PR_LIMIT.to_string();
-    gh_output(
+) -> Option<Vec<serde_json::Value>> {
+    let limit = LISTING_LIMIT.to_string();
+    let json = gh_run(
         repo,
         &[
             "pr", "list", "--state", state, "--json", fields, "--limit", &limit,
         ],
-        patience.list_timeout(),
-        false,
-    )
-    .ok()
+        patience,
+    )?;
+    match serde_json::from_str(&json).ok()? {
+        serde_json::Value::Array(rows) => Some(rows),
+        _ => None,
+    }
+}
+
+/// Run one `gh` query under a hard timeout. A timed-out child is killed and
+/// reaped instead of lingering after the picker has moved on.
+fn gh_run(repo: &str, args: &[&str], patience: FetchPatience) -> Option<String> {
+    gh_output(repo, args, patience.list_timeout(), false).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,47 +498,6 @@ fn parse_thread_counts(json: &str) -> Option<HashMap<String, ThreadCount>> {
         );
     }
     Some(counts)
-}
-
-fn parse_gh_many(
-    json: &str,
-    branch_heads: &[(String, String)],
-    includes_closed: bool,
-) -> Option<HashMap<String, PrInfo>> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let prs = value.as_array()?;
-    let complete = includes_closed && prs.len() < PR_LIMIT;
-    let mut by_branch: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
-    for pr in prs {
-        if let Some(branch) = pr.get("headRefName").and_then(|name| name.as_str()) {
-            by_branch.entry(branch).or_default().push(pr);
-        }
-    }
-
-    let mut result = HashMap::with_capacity(branch_heads.len());
-    for (branch, head) in branch_heads {
-        let selected = by_branch
-            .get(branch.as_str())
-            .and_then(|candidates| select_pr_candidate(candidates, head));
-        if let Some(info) = selected {
-            result.insert(branch.clone(), info);
-        } else if complete {
-            result.insert(branch.clone(), PrInfo::default());
-        }
-    }
-    Some(result)
-}
-
-#[cfg(test)]
-fn parse_gh(json: &str, current_head: &str) -> Option<PrInfo> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
-    let prs: Vec<_> = value.as_array()?.iter().collect();
-    Some(select_pr(&prs, current_head))
-}
-
-#[cfg(test)]
-fn select_pr(prs: &[&serde_json::Value], current_head: &str) -> PrInfo {
-    select_pr_candidate(prs, current_head).unwrap_or_default()
 }
 
 fn select_pr_candidate(prs: &[&serde_json::Value], current_head: &str) -> Option<PrInfo> {
@@ -602,11 +690,11 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_file, cache_store, cached_many, first_line, now_ms, parse_gh, parse_gh_many,
+        cache_file, cache_store, cached_many, first_line, now_ms, parse_branch_prs,
         parse_pr_target, parse_thread_counts, prune_stale_cache, refresh_file, refresh_status,
-        repo_cache_dir, run_with_timeout, store_last_refresh, store_refresh_failure, CacheEntry,
-        FetchPatience, GhError, PrInfo, ThreadCount, CACHE_MAX_AGE, CACHE_TTL_MS,
-        INTERACTIVE_LIST_TIMEOUT, LIST_TIMEOUT, PR_LIMIT,
+        repo_cache_dir, resolve_from_listings, run_with_timeout, store_last_refresh,
+        store_refresh_failure, CacheEntry, FetchPatience, GhError, PrInfo, ThreadCount,
+        CACHE_MAX_AGE, CACHE_TTL_MS, INTERACTIVE_LIST_TIMEOUT, LIST_TIMEOUT,
     };
     use crate::util;
     use std::path::{Path, PathBuf};
@@ -652,7 +740,7 @@ mod tests {
             {"number":1,"state":"MERGED","headRefOid":"head","mergeStateStatus":"CLEAN"},
             {"number":2,"state":"OPEN","headRefOid":"head","mergeStateStatus":"DIRTY"}
         ]"#;
-        let pr = parse_gh(json, "head").unwrap();
+        let pr = parse_branch_prs(json, "head").unwrap();
         assert_eq!(pr.number, Some(2));
         assert!(!pr.merged);
         assert!(pr.conflict);
@@ -663,69 +751,63 @@ mod tests {
         let json = r#"[
             {"number":1,"state":"MERGED","headRefOid":"merged-head","mergeStateStatus":"CLEAN"}
         ]"#;
-        let merged = parse_gh(json, "merged-head").unwrap();
+        let merged = parse_branch_prs(json, "merged-head").unwrap();
         assert_eq!(merged.number, Some(1));
         assert!(merged.merged);
 
-        let stale = parse_gh(json, "new-local-head").unwrap();
+        let stale = parse_branch_prs(json, "new-local-head").unwrap();
         assert_eq!(stale.number, None);
         assert!(!stale.merged);
     }
 
+    /// The remove picker exists to retire finished work, so a branch whose only
+    /// pull request was merged long ago must still report it. That is what the
+    /// per-branch query is for; the capped listings cannot see back that far.
     #[test]
-    fn repository_wide_response_is_grouped_by_branch() {
+    fn a_branch_query_reports_a_merged_pull_request() {
         let json = r#"[
+            {"number":16071,"state":"MERGED","headRefName":"kees/fix","headRefOid":"head"}
+        ]"#;
+        let pr = parse_branch_prs(json, "head").unwrap();
+        assert_eq!(pr.number, Some(16071));
+        assert!(pr.merged);
+    }
+
+    /// An empty per-branch response is an answer — this branch has no pull
+    /// request — and gets cached as one. An unreadable response is not.
+    #[test]
+    fn a_branch_query_distinguishes_no_pull_request_from_no_answer() {
+        let none = parse_branch_prs("[]", "head").unwrap();
+        assert_eq!(none.number, None);
+        assert!(!none.merged);
+
+        assert!(parse_branch_prs("not json", "head").is_none());
+        assert!(parse_branch_prs(r#"{"message":"rate limited"}"#, "head").is_none());
+    }
+
+    #[test]
+    fn listings_are_grouped_by_branch() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
             {"number":1,"state":"OPEN","headRefName":"one","headRefOid":"one-head"},
             {"number":2,"state":"MERGED","headRefName":"two","headRefOid":"two-head"},
             {"number":3,"state":"OPEN","headRefName":"other","headRefOid":"other-head"}
-        ]"#;
-        let branches = vec![
+        ]"#,
+        )
+        .unwrap();
+        let branches = [
             ("one".to_string(), "one-head".to_string()),
             ("two".to_string(), "two-head".to_string()),
             ("none".to_string(), "none-head".to_string()),
         ];
-        let prs = parse_gh_many(json, &branches, true).unwrap();
+        let wanted: Vec<_> = branches.iter().collect();
+        let prs = resolve_from_listings(&rows, &wanted);
         assert_eq!(prs["one"].number, Some(1));
         assert_eq!(prs["two"].number, Some(2));
         assert!(prs["two"].merged);
-        assert_eq!(prs["none"].number, None);
-    }
-
-    #[test]
-    fn saturated_response_does_not_cache_false_negative() {
-        let prs: Vec<_> = (0..PR_LIMIT)
-            .map(|index| {
-                serde_json::json!({
-                    "number": index,
-                    "state": if index == 0 { "CLOSED" } else { "OPEN" },
-                    "headRefName": if index == 0 {
-                        "missing".to_string()
-                    } else {
-                        format!("other-{index}")
-                    },
-                    "headRefOid": "head"
-                })
-            })
-            .collect();
-        let json = serde_json::to_string(&prs).unwrap();
-        let requested = vec![("missing".to_string(), "head".to_string())];
-        assert!(!parse_gh_many(&json, &requested, true)
-            .unwrap()
-            .contains_key("missing"));
-    }
-
-    #[test]
-    fn open_only_response_does_not_cache_merged_branches_as_missing() {
-        let json = r#"[
-            {"number":2,"state":"OPEN","headRefName":"open","headRefOid":"open-head"}
-        ]"#;
-        let branches = vec![
-            ("open".to_string(), "open-head".to_string()),
-            ("possibly-merged".to_string(), "merged-head".to_string()),
-        ];
-        let prs = parse_gh_many(json, &branches, false).unwrap();
-        assert_eq!(prs["open"].number, Some(2));
-        assert!(!prs.contains_key("possibly-merged"));
+        // Missing from a capped listing means "not seen", never "has none":
+        // caching that as an answer is how a merged branch loses its number.
+        assert!(!prs.contains_key("none"));
     }
 
     #[test]
