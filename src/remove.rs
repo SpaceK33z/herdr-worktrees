@@ -6,7 +6,9 @@ use crate::git;
 use crate::herdr;
 use crate::model;
 use crate::render;
+use crate::status::{self, ChangeCounts, SyncKind};
 use crate::tty;
+use crate::util;
 use anyhow::{Context as _, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::ffi::CString;
@@ -18,6 +20,15 @@ use std::time::{Duration, Instant};
 const COL_SAFETY: usize = 16;
 const PROGRESS_DONE: &str = "__HERDR_WORKTREE_REMOVE_DONE__";
 const PROGRESS_UPDATE: &str = "__HERDR_WORKTREE_REMOVE_UPDATE__";
+const PROGRESS_PID: &str = "__HERDR_WORKTREE_REMOVE_PID__";
+/// Fields per target in the `remove-bg-batch` argv protocol.
+const BATCH_FIELDS: usize = 4;
+/// Wire code for "no risks", the one verdict `RemovalRisk` cannot encode.
+const SAFE_CODE: &str = "safe";
+/// How long the follower waits for the worker's pid header before deciding the
+/// worker never started. The header is written before any git work, so this
+/// only has to cover process startup.
+const PROGRESS_PID_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 struct RemovalTarget {
@@ -42,98 +53,140 @@ struct PublicationProof {
 
 struct RemovalInspection {
     prepared: PreparedRemoval,
-    changes: RemovalChanges,
+    changes: ChangeCounts,
 }
 
-#[derive(Clone, Copy, Default)]
-struct RemovalChanges {
-    staged: u32,
-    unstaged: u32,
-    untracked: u32,
-}
-
-impl RemovalChanges {
-    fn dirty(self) -> bool {
-        self.staged > 0 || self.unstaged > 0 || self.untracked > 0
-    }
-
-    fn display(self) -> String {
-        if !self.dirty() {
-            "clean".to_string()
-        } else if self.staged == 0 && self.unstaged == 0 {
-            "untracked".to_string()
-        } else if self.untracked == 0 {
-            format!("+{} ~{}", self.staged, self.unstaged)
-        } else {
-            format!("+{} ~{} ?{}", self.staged, self.unstaged, self.untracked)
-        }
+/// The removal picker's changes column. Unlike the switch picker it has room to
+/// name untracked files separately, because they are the work most easily lost.
+fn changes_display(changes: ChangeCounts) -> String {
+    let ChangeCounts {
+        staged,
+        unstaged,
+        untracked,
+    } = changes;
+    if !changes.dirty() {
+        "clean".to_string()
+    } else if staged == 0 && unstaged == 0 {
+        "untracked".to_string()
+    } else if untracked == 0 {
+        format!("+{staged} ~{unstaged}")
+    } else {
+        format!("+{staged} ~{unstaged} ?{untracked}")
     }
 }
 
+/// One reason a removal is not obviously safe. The table order defines the
+/// order of flags in `RemovalRisk::code`, and must stay in step with
+/// `RemovalRisk::flags`.
+struct RiskFlag {
+    /// Wire token used by the `remove-bg-batch` argv protocol.
+    code: &'static str,
+    /// Phrase for the confirmation prompt.
+    description: &'static str,
+    /// Column label when this is the only risk.
+    label: &'static str,
+    /// Column label when several risks share the 16-column safety cell.
+    short_label: &'static str,
+}
+
+static RISK_FLAGS: [RiskFlag; 3] = [
+    RiskFlag {
+        code: "dirty",
+        description: "uncommitted changes",
+        label: "dirty",
+        short_label: "dirty",
+    },
+    RiskFlag {
+        code: "unpublished",
+        description: "unpublished commits",
+        label: "unpublished",
+        short_label: "unpub",
+    },
+    RiskFlag {
+        code: "detached",
+        description: "a detached HEAD",
+        label: "detached",
+        short_label: "detach",
+    },
+];
+
+/// The risks a removal carries. `Option<RemovalRisk>` is the safety verdict:
+/// `None` means safe, `Some` means at least one flag is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemovalRisk {
-    Dirty,
-    Unpublished,
-    DirtyAndUnpublished,
-    Detached,
-    DirtyAndDetached,
+struct RemovalRisk {
+    dirty: bool,
+    unpublished: bool,
+    detached: bool,
 }
 
 impl RemovalRisk {
-    fn description(self) -> &'static str {
-        match self {
-            Self::Dirty => "uncommitted changes",
-            Self::Unpublished => "unpublished commits",
-            Self::DirtyAndUnpublished => "uncommitted changes and unpublished commits",
-            Self::Detached => "a detached HEAD",
-            Self::DirtyAndDetached => "uncommitted changes and a detached HEAD",
-        }
+    fn flags(self) -> [bool; 3] {
+        [self.dirty, self.unpublished, self.detached]
     }
 
-    fn label(self) -> &'static str {
-        match self {
-            Self::Dirty => "⚠ dirty",
-            Self::Unpublished => "⚠ unpublished",
-            Self::DirtyAndUnpublished => "⚠ dirty + unpub",
-            Self::Detached => "⚠ detached",
-            Self::DirtyAndDetached => "⚠ dirty + detach",
-        }
+    fn set_flags(self) -> Vec<&'static RiskFlag> {
+        RISK_FLAGS
+            .iter()
+            .zip(self.flags())
+            .filter_map(|(flag, set)| set.then_some(flag))
+            .collect()
     }
 
-    fn code(self) -> &'static str {
-        match self {
-            Self::Dirty => "dirty",
-            Self::Unpublished => "unpublished",
-            Self::DirtyAndUnpublished => "dirty-unpublished",
-            Self::Detached => "detached",
-            Self::DirtyAndDetached => "dirty-detached",
-        }
-    }
-
-    fn from_code(code: &str) -> Option<Self> {
-        match code {
-            "dirty" => Some(Self::Dirty),
-            "unpublished" => Some(Self::Unpublished),
-            "dirty-unpublished" => Some(Self::DirtyAndUnpublished),
-            "detached" => Some(Self::Detached),
-            "dirty-detached" => Some(Self::DirtyAndDetached),
-            _ => None,
-        }
-    }
-
-    fn dirty(self) -> bool {
-        matches!(
-            self,
-            Self::Dirty | Self::DirtyAndUnpublished | Self::DirtyAndDetached
+    fn description(self) -> String {
+        join_phrases(
+            &self
+                .set_flags()
+                .iter()
+                .map(|flag| flag.description)
+                .collect::<Vec<_>>(),
         )
     }
 
-    fn unpublished(self) -> bool {
-        matches!(self, Self::Unpublished | Self::DirtyAndUnpublished)
+    fn label(self) -> String {
+        let flags = self.set_flags();
+        let labels: Vec<_> = if flags.len() == 1 {
+            flags.iter().map(|flag| flag.label).collect()
+        } else {
+            flags.iter().map(|flag| flag.short_label).collect()
+        };
+        format!("⚠ {}", labels.join(" + "))
     }
 
-    fn detached(self) -> bool {
-        matches!(self, Self::Detached | Self::DirtyAndDetached)
+    /// Wire encoding: the set flags' codes joined by `-`, e.g.
+    /// `dirty-unpublished`.
+    fn code(self) -> String {
+        self.set_flags()
+            .iter()
+            .map(|flag| flag.code)
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        let mut risk = Self {
+            dirty: false,
+            unpublished: false,
+            detached: false,
+        };
+        for token in code.split('-') {
+            let index = RISK_FLAGS.iter().position(|flag| flag.code == token)?;
+            let flags = [&mut risk.dirty, &mut risk.unpublished, &mut risk.detached];
+            if *flags[index] {
+                // A repeated token is a malformed code, not a stronger risk.
+                return None;
+            }
+            *flags[index] = true;
+        }
+        Some(risk)
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_phrases(phrases: &[&str]) -> String {
+    match phrases {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -156,9 +209,7 @@ pub fn run_interactive() -> Result<()> {
         return Ok(());
     }
 
-    let exe = std::env::current_exe()
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "herdr-worktrees".to_string());
+    let exe = crate::util::self_exe();
     let refresh_cmd = format!("{} remove-list", crate::util::shell_escape(&exe));
     let cur_path = git::current_toplevel();
     let selections = run_remove_fzf(&list, &header, footer, &cur_path, &refresh_cmd)?;
@@ -208,18 +259,15 @@ fn render_remove_candidates(
         let branch = branch_name(worktree);
         let mut display = worktree.clone();
         let safety = if let Some(inspections) = &inspections {
-            match &inspections[index] {
-                Ok(inspection) => {
-                    display.staged = inspection.changes.staged;
-                    display.unstaged = inspection.changes.unstaged;
-                    display.dirty = inspection.changes.dirty();
-                    display.changes = inspection.changes.display();
-                    render_safety(inspection.prepared.authorized_risk)
-                }
-                Err(_) => {
-                    display.changes = "unknown".to_string();
-                    render_unverified()
-                }
+            if let Ok(inspection) = &inspections[index] {
+                display.staged = inspection.changes.staged;
+                display.unstaged = inspection.changes.unstaged;
+                display.dirty = inspection.changes.dirty();
+                display.changes = changes_display(inspection.changes);
+                render_safety(inspection.prepared.authorized_risk)
+            } else {
+                display.changes = "unknown".to_string();
+                render_unverified()
             }
         } else {
             render_checking()
@@ -235,40 +283,28 @@ fn render_remove_candidates(
     rows.join("\n")
 }
 
+/// How many safety checks run at once. Deliberately modest: each one is a
+/// `git status` over a whole worktree, and the list is short.
+const INSPECT_WORKERS: usize = 8;
+
+/// Run `inspect` over `items` in parallel. A panicking check turns into a
+/// per-item error instead of a missing row — an unverified row must never look
+/// safe.
+fn inspect_in_parallel<T: Sync, R: Send>(
+    items: &[T],
+    inspect: impl Fn(&T) -> Result<R> + Sync,
+) -> Vec<Result<R>> {
+    util::parallel_map(items, INSPECT_WORKERS, inspect)
+        .into_iter()
+        .map(|inspected| inspected.unwrap_or_else(|| Err(anyhow::anyhow!("safety check panicked"))))
+        .collect()
+}
+
 fn inspect_candidates(
     worktrees: &[&model::Worktree],
     config: &Config,
 ) -> Vec<Result<RemovalInspection>> {
-    if worktrees.is_empty() {
-        return Vec::new();
-    }
-    let workers = worktrees.len().min(8);
-    let chunk_size = worktrees.len().div_ceil(workers);
-    std::thread::scope(|scope| {
-        worktrees
-            .chunks(chunk_size)
-            .map(|chunk| {
-                (
-                    chunk.len(),
-                    scope.spawn(|| {
-                        chunk
-                            .iter()
-                            .map(|worktree| inspect_candidate(worktree, config))
-                            .collect::<Vec<_>>()
-                    }),
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|(len, handle)| {
-                handle.join().unwrap_or_else(|_| {
-                    (0..len)
-                        .map(|_| Err(anyhow::anyhow!("safety check panicked")))
-                        .collect()
-                })
-            })
-            .collect()
-    })
+    inspect_in_parallel(worktrees, |worktree| inspect_candidate(worktree, config))
 }
 
 fn inspect_targets(
@@ -289,40 +325,15 @@ fn inspect_targets(
                 .collect();
         }
     };
-    let workers = targets.len().min(8);
-    let chunk_size = targets.len().div_ceil(workers);
-    std::thread::scope(|scope| {
-        targets
-            .chunks(chunk_size)
-            .map(|chunk| {
-                (
-                    chunk.len(),
-                    scope.spawn(|| {
-                        chunk
-                            .iter()
-                            .map(|target| inspect_target_in_records(target, &records, config, repo))
-                            .collect::<Vec<_>>()
-                    }),
-                )
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|(len, handle)| {
-                handle.join().unwrap_or_else(|_| {
-                    (0..len)
-                        .map(|_| Err(anyhow::anyhow!("safety check panicked")))
-                        .collect()
-                })
-            })
-            .collect()
+    inspect_in_parallel(targets, |target| {
+        inspect_target_in_records(target, &records, config, repo)
     })
 }
 
 fn inspect_candidate(worktree: &model::Worktree, config: &Config) -> Result<RemovalInspection> {
     let changes = inspect_changes(&worktree.path)?;
     let detached = worktree.branch.is_empty();
-    let unpublished =
-        config.delete_branch() && !detached && sync_has_unpublished(&worktree.sync_kind);
+    let unpublished = config.delete_branch() && !detached && sync_has_unpublished(worktree.sync_kind);
     Ok(RemovalInspection {
         prepared: PreparedRemoval {
             branch: branch_name(worktree),
@@ -335,16 +346,15 @@ fn inspect_candidate(worktree: &model::Worktree, config: &Config) -> Result<Remo
     })
 }
 
-/// The `remove --target <branch> <path> <kind> <changes>` one-off delete used by
-/// the picker's ctrl-d.
+/// The `remove --target <branch> <path>` one-off delete used by the picker's
+/// ctrl-d. The row's cached kind and changes used to be passed along too; the
+/// removal re-inspects both, so they are no longer part of the protocol.
 pub fn run_target(args: &[String]) -> Result<()> {
-    if args.first().map(String::as_str) != Some("--target") || args.len() != 5 {
-        anyhow::bail!("usage: remove --target <branch> <path> <kind> <changes>");
+    if args.first().map(String::as_str) != Some("--target") || args.len() != 3 {
+        anyhow::bail!("usage: remove --target <branch> <path>");
     }
     let branch = &args[1];
     let path = &args[2];
-    let kind = &args[3];
-    let changes = &args[4];
 
     let repo_path = git::repo_root()?;
     let repo = repo_path.to_string_lossy().into_owned();
@@ -353,19 +363,12 @@ pub fn run_target(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let config = Config::load()?;
-    delete_worktree(branch, path, kind, changes, &config, &repo)
+    delete_worktree(branch, path, &config, &repo)
 }
 
 /// Confirm, remove the checkout, optionally delete the branch, and close the
 /// Herdr workspace that was open for it.
-pub fn delete_worktree(
-    branch: &str,
-    path: &str,
-    _kind: &str,
-    _changes: &str,
-    config: &Config,
-    repo: &str,
-) -> Result<()> {
+pub fn delete_worktree(branch: &str, path: &str, config: &Config, repo: &str) -> Result<()> {
     delete_worktrees(
         &[RemovalTarget {
             branch: branch.to_string(),
@@ -410,26 +413,12 @@ fn delete_worktrees(targets: &[RemovalTarget], config: &Config, repo: &str) -> R
 
     // One detached process removes the whole selection and sends one summary
     // notification, rather than opening a process and notification per row.
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "herdr-worktrees".to_string());
+    let exe = crate::util::self_exe();
     let log = background::log_path("remove");
     std::fs::File::create(&log).context("creating removal progress log")?;
     open_progress_pane(targets, config, repo, &log, &exe);
 
-    let mut args = vec!["remove-bg-batch".to_string(), repo.to_string()];
-    for target in &prepared {
-        args.push(target.branch.clone());
-        args.push(target.path.clone());
-        args.push(target.head.clone());
-        args.push(
-            target
-                .authorized_risk
-                .map(RemovalRisk::code)
-                .unwrap_or("safe")
-                .to_string(),
-        );
-    }
+    let args = encode_batch_args(repo, &prepared);
     if let Err(error) = background::spawn_detached(&exe, &args, &log) {
         append_progress(&log, &format!("Could not start removal: {error}"));
         append_progress(&log, PROGRESS_DONE);
@@ -498,39 +487,21 @@ fn append_progress(log: &str, message: &str) {
 }
 
 fn removal_risk(dirty: bool, unpublished: bool, detached: bool) -> Option<RemovalRisk> {
-    if detached {
-        return Some(if dirty {
-            RemovalRisk::DirtyAndDetached
-        } else {
-            RemovalRisk::Detached
-        });
-    }
-    match (dirty, unpublished) {
-        (true, true) => Some(RemovalRisk::DirtyAndUnpublished),
-        (true, false) => Some(RemovalRisk::Dirty),
-        (false, true) => Some(RemovalRisk::Unpublished),
-        (false, false) => None,
-    }
+    // A detached HEAD has no branch, so there is nothing to publish.
+    let unpublished = unpublished && !detached;
+    (dirty || unpublished || detached).then_some(RemovalRisk {
+        dirty,
+        unpublished,
+        detached,
+    })
 }
 
 fn render_safety(risk: Option<RemovalRisk>) -> String {
     let (label, color) = match risk {
-        Some(risk) => (
-            risk.label(),
-            if matches!(
-                risk,
-                RemovalRisk::Dirty
-                    | RemovalRisk::DirtyAndUnpublished
-                    | RemovalRisk::DirtyAndDetached
-            ) {
-                "31"
-            } else {
-                "33"
-            },
-        ),
-        None => ("✓ safe", "32"),
+        Some(risk) => (risk.label(), if risk.dirty { "31" } else { "33" }),
+        None => ("✓ safe".to_string(), "32"),
     };
-    format!("\x1b[{color}m{}\x1b[0m", render::pad(label, COL_SAFETY))
+    format!("\x1b[{color}m{}\x1b[0m", render::pad(&label, COL_SAFETY))
 }
 
 fn render_unverified() -> String {
@@ -651,7 +622,7 @@ fn inspect_target_in_records(
     })
 }
 
-fn inspect_changes(path: &str) -> Result<RemovalChanges> {
+fn inspect_changes(path: &str) -> Result<ChangeCounts> {
     let output = git::git_output(&[
         "--no-optional-locks",
         "-C",
@@ -666,31 +637,14 @@ fn inspect_changes(path: &str) -> Result<RemovalChanges> {
         anyhow::bail!("git status failed for {path}");
     }
 
-    Ok(parse_changes(&output.stdout))
+    Ok(status::parse_porcelain(&output.stdout))
 }
 
-fn parse_changes(output: &[u8]) -> RemovalChanges {
-    let mut changes = RemovalChanges::default();
-    for line in output.split(|byte| *byte == b'\n') {
-        if line.len() < 2 {
-            continue;
-        }
-        if line[0] == b'?' && line[1] == b'?' {
-            changes.untracked += 1;
-            continue;
-        }
-        if line[0] != b' ' && line[0] != b'?' {
-            changes.staged += 1;
-        }
-        if line[1] != b' ' {
-            changes.unstaged += 1;
-        }
-    }
-    changes
-}
-
-fn sync_has_unpublished(sync_kind: &str) -> bool {
-    !matches!(sync_kind, "synced" | "behind")
+/// Which sync states may still hold commits that exist nowhere else. Anything
+/// the picker could not place — a missing upstream, a state it has not computed
+/// yet — counts as unpublished, so deleting the branch needs confirmation.
+fn sync_has_unpublished(sync_kind: SyncKind) -> bool {
+    !matches!(sync_kind, SyncKind::Synced | SyncKind::Behind)
 }
 
 fn branch_publication(repo: &str, branch: &str) -> Result<(bool, Option<PublicationProof>)> {
@@ -743,20 +697,18 @@ fn risk_is_covered(authorized: Option<RemovalRisk>, current: Option<RemovalRisk>
     let Some(authorized) = authorized else {
         return false;
     };
-    (!current.dirty() || authorized.dirty())
-        && (!current.unpublished() || authorized.unpublished())
-        && (!current.detached() || authorized.detached())
+    (!current.dirty || authorized.dirty)
+        && (!current.unpublished || authorized.unpublished)
+        && (!current.detached || authorized.detached)
 }
 
 /// Follow a removal log in a temporary Herdr pane until the worker writes its
-/// completion marker.
+/// completion marker, or until the worker is gone without having written one.
 pub fn run_progress(args: &[String]) -> Result<()> {
     if args.len() != 1 {
         anyhow::bail!("usage: remove-progress <log>");
     }
     let log = &args[0];
-    let mut shown = 0usize;
-    let mut pending = String::new();
     let progress = ProgressBar::new_spinner();
     progress.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")?
@@ -764,6 +716,31 @@ pub fn run_progress(args: &[String]) -> Result<()> {
     );
     progress.set_message("Preparing removal…");
     progress.enable_steady_tick(Duration::from_millis(80));
+
+    let outcome = follow_progress(log, &progress);
+    progress.finish_and_clear();
+    if let ProgressOutcome::WorkerLost(reason) = outcome {
+        tty::err(&format!(
+            "{reason}; some worktrees may not have been removed — see {log}"
+        ));
+        tty::wait_key();
+    }
+    Ok(())
+}
+
+enum ProgressOutcome {
+    Done,
+    /// The worker is gone without having written its completion marker.
+    WorkerLost(&'static str),
+}
+
+/// Mirror the worker's log into `progress` until it finishes or disappears.
+fn follow_progress(log: &str, progress: &ProgressBar) -> ProgressOutcome {
+    let mut shown = 0usize;
+    let mut pending = String::new();
+    let mut worker = None;
+    let mut missing_worker_polls = 0u32;
+    let started = Instant::now();
 
     loop {
         if let Ok(bytes) = std::fs::read(log) {
@@ -778,10 +755,11 @@ pub fn run_progress(args: &[String]) -> Result<()> {
                     let line: String = pending.drain(..=newline).collect();
                     let line = line.trim_end_matches(['\r', '\n']);
                     if line == PROGRESS_DONE {
-                        progress.finish_and_clear();
-                        return Ok(());
+                        return ProgressOutcome::Done;
                     }
-                    if let Some(update) = line.strip_prefix(PROGRESS_UPDATE) {
+                    if line.starts_with(PROGRESS_PID) {
+                        worker = parse_pid_header(line).or(worker);
+                    } else if let Some(update) = line.strip_prefix(PROGRESS_UPDATE) {
                         progress.set_message(update.to_string());
                     } else {
                         progress.println(line);
@@ -789,8 +767,47 @@ pub fn run_progress(args: &[String]) -> Result<()> {
                 }
             }
         }
+
+        // A worker killed outright (SIGKILL, OOM) never runs its completion
+        // guard, so without this the pane would spin until closed by hand.
+        match worker {
+            Some(pid) if !process_is_running(pid) => {
+                missing_worker_polls += 1;
+                // Give a worker that exited normally one more poll to have its
+                // final marker land on disk before calling it dead.
+                if missing_worker_polls > 1 {
+                    return ProgressOutcome::WorkerLost("removal worker exited unexpectedly");
+                }
+            }
+            Some(_) => missing_worker_polls = 0,
+            None => {
+                if started.elapsed() > PROGRESS_PID_TIMEOUT {
+                    return ProgressOutcome::WorkerLost("removal worker never started");
+                }
+            }
+        }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn parse_pid_header(line: &str) -> Option<u32> {
+    line.strip_prefix(PROGRESS_PID)?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
+}
+
+/// Whether `pid` still exists. Only `ESRCH` proves it is gone; every other
+/// failure keeps the follower waiting rather than reporting a false death.
+fn process_is_running(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn report_progress(message: &str) {
@@ -811,52 +828,95 @@ impl Drop for ProgressCompletion {
     }
 }
 
-/// Detached background mode for a multi-selection. All removals share one
-/// process and produce one summary notification.
-pub fn run_background_batch(args: &[String]) -> Result<()> {
-    if args.len() < 5 || !(args.len() - 1).is_multiple_of(4) {
+/// argv for the detached worker: `remove-bg-batch <repo>` plus one
+/// branch/path/head/risk quadruple per target. `decode_batch_args` is the other
+/// half of this protocol.
+fn encode_batch_args(repo: &str, targets: &[PreparedRemoval]) -> Vec<String> {
+    let mut args = vec!["remove-bg-batch".to_string(), repo.to_string()];
+    for target in targets {
+        args.push(target.branch.clone());
+        args.push(target.path.clone());
+        args.push(target.head.clone());
+        args.push(
+            target
+                .authorized_risk
+                .map_or_else(|| SAFE_CODE.to_string(), RemovalRisk::code),
+        );
+    }
+    args
+}
+
+/// Decode the worker's argv tail (everything after the subcommand) into the
+/// repo and one entry per target. An unreadable safety code fails just that
+/// target — the batch keeps going, but the target is never removed.
+fn decode_batch_args(args: &[String]) -> Result<(&str, Vec<Result<PreparedRemoval>>)> {
+    if args.len() < 1 + BATCH_FIELDS || !(args.len() - 1).is_multiple_of(BATCH_FIELDS) {
         anyhow::bail!(
             "usage: remove-bg-batch <repo> <branch> <path> <head> <risk> [<branch> <path> <head> <risk> ...]"
         );
     }
+    let targets = args[1..]
+        .chunks_exact(BATCH_FIELDS)
+        .map(|fields| {
+            let authorized_risk = if fields[3] == SAFE_CODE {
+                None
+            } else {
+                let Some(risk) = RemovalRisk::from_code(&fields[3]) else {
+                    return Err(anyhow::anyhow!(
+                        "'{}': invalid safety authorization",
+                        fields[0]
+                    ));
+                };
+                Some(risk)
+            };
+            Ok(PreparedRemoval {
+                branch: fields[0].clone(),
+                path: fields[1].clone(),
+                head: fields[2].clone(),
+                authorized_risk,
+                publication_proof: None,
+            })
+        })
+        .collect();
+    Ok((&args[0], targets))
+}
+
+/// Detached background mode for a multi-selection. All removals share one
+/// process and produce one summary notification.
+pub fn run_background_batch(args: &[String]) -> Result<()> {
+    // Set up before anything that can fail, so every exit path closes the
+    // progress pane. The follower also needs the pid to tell "still removing"
+    // from "worker killed".
     let _completion = ProgressCompletion;
-    let repo = &args[0];
+    report_progress(&format!("{PROGRESS_PID}{}", std::process::id()));
+    let (repo, decoded) = decode_batch_args(args)?;
     let config = Config::load()?;
-    let total = (args.len() - 1) / 4;
+    let total = decoded.len();
     let mut removed = 0usize;
+    let mut removed_branch = String::new();
     let mut bytes = 0u64;
     let mut failures = Vec::new();
 
-    for (index, fields) in args[1..].chunks_exact(4).enumerate() {
+    for (index, decoded) in decoded.into_iter().enumerate() {
+        let target = match decoded {
+            Ok(target) => target,
+            Err(error) => {
+                let failure = format!("{error:#}");
+                report_progress(&format!("✕ [{}/{}] {failure}", index + 1, total));
+                failures.push(failure);
+                continue;
+            }
+        };
         report_progress_update(&format!(
             "[{}/{}] Verifying '{}'…",
             index + 1,
             total,
-            fields[0]
+            target.branch
         ));
-        let authorized_risk = if fields[3] == "safe" {
-            None
-        } else {
-            match RemovalRisk::from_code(&fields[3]) {
-                Some(risk) => Some(risk),
-                None => {
-                    let failure = format!("'{}': invalid safety authorization", fields[0]);
-                    report_progress(&format!("✕ [{}/{}] {failure}", index + 1, total));
-                    failures.push(failure);
-                    continue;
-                }
-            }
-        };
-        let target = PreparedRemoval {
-            branch: fields[0].clone(),
-            path: fields[1].clone(),
-            head: fields[2].clone(),
-            authorized_risk,
-            publication_proof: None,
-        };
         match validate_and_delete(&target, &config, repo) {
             Ok((size, warning)) => {
                 removed += 1;
+                removed_branch.clone_from(&target.branch);
                 bytes += size;
                 report_progress(&format!(
                     "✓ [{}/{}] Removed '{}'{}",
@@ -884,7 +944,7 @@ pub fn run_background_batch(args: &[String]) -> Result<()> {
             "worktrees removed"
         };
         let body = if total == 1 {
-            format!("removed '{}'{}", args[1], freed_suffix(bytes))
+            format!("removed '{removed_branch}'{}", freed_suffix(bytes))
         } else {
             format!("removed {total} worktrees{}", freed_suffix(bytes))
         };
@@ -922,7 +982,7 @@ fn validate_and_delete(
     if !risk_is_covered(target.authorized_risk, current.authorized_risk) {
         anyhow::bail!("safety state changed after confirmation; worktree was kept");
     }
-    let publication_proof = if target.authorized_risk.is_some_and(RemovalRisk::unpublished) {
+    let publication_proof = if target.authorized_risk.is_some_and(|risk| risk.unpublished) {
         None
     } else {
         current.publication_proof.as_ref()
@@ -941,7 +1001,7 @@ fn perform_delete(
     let wsid = herdr::worktree_workspace_id(&target.path, repo);
 
     let mut args = vec!["-C", repo, "worktree", "remove"];
-    if target.authorized_risk.is_some_and(RemovalRisk::dirty) {
+    if target.authorized_risk.is_some_and(|risk| risk.dirty) {
         args.push("--force");
     }
     args.push(&target.path);
@@ -1163,63 +1223,256 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_publication, build_remove_bind, delete_branch_ref, freed_suffix, inspect_target,
-        parse_changes, parse_targets, removal_risk, remove_fzf_args, render_remove_candidates,
-        risk_is_covered, sync_has_unpublished, validate_and_delete, PreparedRemoval,
-        RemovalChanges, RemovalRisk, RemovalTarget,
+        branch_publication, build_remove_bind, changes_display, decode_batch_args,
+        delete_branch_ref, encode_batch_args, follow_progress, freed_suffix, inspect_target,
+        parse_pid_header, parse_targets, process_is_running, removal_risk, remove_fzf_args,
+        render_remove_candidates, risk_is_covered, sync_has_unpublished, validate_and_delete,
+        ChangeCounts, PreparedRemoval, ProgressOutcome, RemovalRisk, RemovalTarget, SyncKind,
     };
     use crate::config::Config;
+    use indicatif::ProgressBar;
     use std::path::Path;
     use std::process::Command;
+
+    fn risk(dirty: bool, unpublished: bool, detached: bool) -> Option<RemovalRisk> {
+        Some(RemovalRisk {
+            dirty,
+            unpublished,
+            detached,
+        })
+    }
 
     #[test]
     fn preserving_the_branch_only_guards_uncommitted_changes() {
         assert_eq!(removal_risk(false, false, false), None);
-        assert_eq!(removal_risk(true, false, false), Some(RemovalRisk::Dirty));
+        assert_eq!(removal_risk(true, false, false), risk(true, false, false));
     }
 
     #[test]
     fn deleting_the_branch_also_guards_unpublished_commits() {
-        assert!(!sync_has_unpublished("synced"));
-        assert!(!sync_has_unpublished("behind"));
-        assert!(sync_has_unpublished("ahead"));
-        assert!(sync_has_unpublished("diverged"));
-        assert!(sync_has_unpublished("local"));
-        assert!(sync_has_unpublished("gone"));
-        assert_eq!(
-            removal_risk(false, true, false),
-            Some(RemovalRisk::Unpublished)
-        );
-        assert_eq!(
-            removal_risk(true, true, false),
-            Some(RemovalRisk::DirtyAndUnpublished)
-        );
+        assert!(!sync_has_unpublished(SyncKind::Synced));
+        assert!(!sync_has_unpublished(SyncKind::Behind));
+        for kind in [
+            SyncKind::Ahead,
+            SyncKind::Diverged,
+            SyncKind::Local,
+            SyncKind::Gone,
+            SyncKind::Detached,
+            SyncKind::Loading,
+        ] {
+            assert!(sync_has_unpublished(kind), "{}", kind.as_str());
+        }
+        assert_eq!(removal_risk(false, true, false), risk(false, true, false));
+        assert_eq!(removal_risk(true, true, false), risk(true, true, false));
         assert_eq!(removal_risk(false, false, false), None);
     }
 
     #[test]
     fn detached_worktrees_are_never_marked_safe() {
-        assert_eq!(
-            removal_risk(false, false, true),
-            Some(RemovalRisk::Detached)
-        );
-        assert_eq!(
-            removal_risk(true, false, true),
-            Some(RemovalRisk::DirtyAndDetached)
-        );
+        assert_eq!(removal_risk(false, false, true), risk(false, false, true));
+        assert_eq!(removal_risk(true, false, true), risk(true, false, true));
+        // A detached HEAD has no branch, so publication cannot apply.
+        assert_eq!(removal_risk(false, true, true), risk(false, false, true));
     }
 
     #[test]
     fn worker_rejects_new_risks_after_confirmation() {
-        assert!(!risk_is_covered(None, Some(RemovalRisk::Dirty)));
+        assert!(!risk_is_covered(None, risk(true, false, false)));
         assert!(!risk_is_covered(
-            Some(RemovalRisk::Dirty),
-            Some(RemovalRisk::DirtyAndUnpublished)
+            risk(true, false, false),
+            risk(true, true, false)
         ));
         assert!(risk_is_covered(
-            Some(RemovalRisk::DirtyAndUnpublished),
-            Some(RemovalRisk::Dirty)
+            risk(true, true, false),
+            risk(true, false, false)
         ));
+        assert!(!risk_is_covered(
+            risk(true, true, false),
+            risk(false, false, true)
+        ));
+    }
+
+    #[test]
+    fn risk_codes_round_trip_and_reject_junk() {
+        for flags in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+        ] {
+            let encoded = risk(flags.0, flags.1, flags.2).unwrap();
+            assert_eq!(RemovalRisk::from_code(&encoded.code()), Some(encoded));
+        }
+        // The wire codes predate the flag struct and must stay readable by both
+        // sides of the argv protocol.
+        assert_eq!(removal_risk(true, false, false).unwrap().code(), "dirty");
+        assert_eq!(
+            removal_risk(true, true, false).unwrap().code(),
+            "dirty-unpublished"
+        );
+        assert_eq!(
+            removal_risk(true, false, true).unwrap().code(),
+            "dirty-detached"
+        );
+        assert_eq!(RemovalRisk::from_code(""), None);
+        assert_eq!(RemovalRisk::from_code("safe"), None);
+        assert_eq!(RemovalRisk::from_code("dirty-dirty"), None);
+        assert_eq!(RemovalRisk::from_code("dirty-bogus"), None);
+    }
+
+    #[test]
+    fn risk_labels_stay_within_the_safety_column() {
+        assert_eq!(removal_risk(true, false, false).unwrap().label(), "⚠ dirty");
+        assert_eq!(
+            removal_risk(false, true, false).unwrap().label(),
+            "⚠ unpublished"
+        );
+        assert_eq!(
+            removal_risk(true, true, false).unwrap().label(),
+            "⚠ dirty + unpub"
+        );
+        assert_eq!(
+            removal_risk(false, false, true).unwrap().label(),
+            "⚠ detached"
+        );
+        assert_eq!(
+            removal_risk(true, false, true).unwrap().label(),
+            "⚠ dirty + detach"
+        );
+        for label in [
+            removal_risk(true, false, false).unwrap().label(),
+            removal_risk(false, true, false).unwrap().label(),
+            removal_risk(true, true, false).unwrap().label(),
+            removal_risk(false, false, true).unwrap().label(),
+            removal_risk(true, false, true).unwrap().label(),
+        ] {
+            assert!(label.chars().count() <= super::COL_SAFETY, "{label}");
+        }
+        assert_eq!(
+            removal_risk(true, true, false).unwrap().description(),
+            "uncommitted changes and unpublished commits"
+        );
+        assert_eq!(
+            removal_risk(true, false, true).unwrap().description(),
+            "uncommitted changes and a detached HEAD"
+        );
+        assert_eq!(
+            RemovalRisk::from_code("dirty-unpublished-detached")
+                .unwrap()
+                .description(),
+            "uncommitted changes, unpublished commits and a detached HEAD"
+        );
+    }
+
+    #[test]
+    fn background_batch_argv_round_trips() {
+        let targets = vec![
+            PreparedRemoval {
+                branch: "feature".to_string(),
+                path: "/tmp/feature".to_string(),
+                head: "abc123".to_string(),
+                authorized_risk: None,
+                publication_proof: None,
+            },
+            PreparedRemoval {
+                branch: "(detached)".to_string(),
+                path: "/tmp/detached".to_string(),
+                head: "def456".to_string(),
+                authorized_risk: removal_risk(true, false, true),
+                publication_proof: None,
+            },
+        ];
+        let args = encode_batch_args("/tmp/repo", &targets);
+        assert_eq!(args[0], "remove-bg-batch");
+        // lib::run strips the subcommand before handing argv to the worker.
+        let (repo, decoded) = decode_batch_args(&args[1..]).unwrap();
+        assert_eq!(repo, "/tmp/repo");
+        assert_eq!(decoded.len(), 2);
+        for (target, decoded) in targets.iter().zip(decoded) {
+            let decoded = decoded.unwrap();
+            assert_eq!(decoded.branch, target.branch);
+            assert_eq!(decoded.path, target.path);
+            assert_eq!(decoded.head, target.head);
+            assert_eq!(decoded.authorized_risk, target.authorized_risk);
+        }
+    }
+
+    #[test]
+    fn background_batch_argv_rejects_malformed_input() {
+        assert!(decode_batch_args(&["/tmp/repo".to_string()]).is_err());
+        assert!(decode_batch_args(&[
+            "/tmp/repo".to_string(),
+            "feature".to_string(),
+            "/tmp/feature".to_string(),
+        ])
+        .is_err());
+        let (_, decoded) = decode_batch_args(&[
+            "/tmp/repo".to_string(),
+            "feature".to_string(),
+            "/tmp/feature".to_string(),
+            "abc123".to_string(),
+            "not-a-risk".to_string(),
+        ])
+        .unwrap();
+        assert!(decoded[0].is_err());
+    }
+
+    #[test]
+    fn progress_pane_detects_a_worker_that_died_without_finishing() {
+        assert_eq!(
+            parse_pid_header("__HERDR_WORKTREE_REMOVE_PID__4821"),
+            Some(4821)
+        );
+        assert_eq!(parse_pid_header("__HERDR_WORKTREE_REMOVE_PID__0"), None);
+        assert_eq!(parse_pid_header("Removing 'feature'…"), None);
+
+        assert!(process_is_running(std::process::id()));
+        assert!(!process_is_running(dead_pid()));
+    }
+
+    #[test]
+    fn progress_pane_stops_following_a_dead_worker_and_keeps_following_a_live_one() {
+        let root = unique_root("progress-follow");
+        std::fs::create_dir_all(&root).unwrap();
+        let log = root.join("remove.log");
+        std::fs::write(
+            &log,
+            format!(
+                "{}{}\n{}Removing 'feature'…\n",
+                super::PROGRESS_PID,
+                dead_pid(),
+                super::PROGRESS_UPDATE
+            ),
+        )
+        .unwrap();
+        let outcome = follow_progress(&log.to_string_lossy(), &ProgressBar::hidden());
+        assert!(matches!(outcome, ProgressOutcome::WorkerLost(_)));
+
+        // A live worker that reports completion still ends the pane normally.
+        std::fs::write(
+            &log,
+            format!(
+                "{}{}\n{}\n",
+                super::PROGRESS_PID,
+                std::process::id(),
+                super::PROGRESS_DONE
+            ),
+        )
+        .unwrap();
+        let outcome = follow_progress(&log.to_string_lossy(), &ProgressBar::hidden());
+        assert!(matches!(outcome, ProgressOutcome::Done));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A pid that is guaranteed to be gone: our own child, already reaped.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("sh").arg("-c").arg("exit 0").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
     }
 
     #[test]
@@ -1238,27 +1491,25 @@ mod tests {
 
     #[test]
     fn removal_changes_distinguish_untracked_files() {
-        let parsed = parse_changes(b"M  staged\n M unstaged\n?? untracked\n");
+        let parsed = crate::status::parse_porcelain(b"M  staged\n M unstaged\n?? untracked\n");
         assert_eq!(
             (parsed.staged, parsed.unstaged, parsed.untracked),
             (1, 1, 1)
         );
-        assert_eq!(RemovalChanges::default().display(), "clean");
+        assert_eq!(changes_display(ChangeCounts::default()), "clean");
         assert_eq!(
-            RemovalChanges {
+            changes_display(ChangeCounts {
                 untracked: 2,
-                ..RemovalChanges::default()
-            }
-            .display(),
+                ..ChangeCounts::default()
+            }),
             "untracked"
         );
         assert_eq!(
-            RemovalChanges {
+            changes_display(ChangeCounts {
                 staged: 1,
                 unstaged: 2,
                 untracked: 3,
-            }
-            .display(),
+            }),
             "+1 ~2 ?3"
         );
     }

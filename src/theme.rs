@@ -139,8 +139,9 @@ fn palette(name: &str) -> ThemeColors {
         "gruvbox-light" => ((7, 102, 120), (66, 123, 88)),
         "one-dark" | "onedark" => ((97, 175, 239), (86, 182, 194)),
         "one-light" | "onelight" => ((64, 120, 242), (1, 132, 188)),
-        "solarized" | "solarized-dark" => ((38, 139, 210), (42, 161, 152)),
-        "solarized-light" => ((38, 139, 210), (42, 161, 152)),
+        // Solarized keeps the same accent hues in both variants; only the
+        // base tones flip between light and dark.
+        "solarized" | "solarized-dark" | "solarized-light" => ((38, 139, 210), (42, 161, 152)),
         "kanagawa" => ((126, 156, 216), (127, 180, 202)),
         "kanagawa-lotus" | "lotus" => ((77, 105, 155), (78, 140, 162)),
         "rose-pine" | "rosepine" => ((196, 167, 231), (156, 207, 216)),
@@ -168,7 +169,9 @@ fn palette(name: &str) -> ThemeColors {
 fn parse_color(value: &str) -> Option<AnsiColor> {
     let value = value.trim().to_lowercase();
     if let Some(hex) = value.strip_prefix('#') {
-        if hex.len() == 6 {
+        // Check for hex digits before slicing: the value comes from the user's
+        // config, and byte-slicing a multibyte character would panic.
+        if hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Some(AnsiColor::rgb(
                 u8::from_str_radix(&hex[0..2], 16).ok()?,
                 u8::from_str_radix(&hex[2..4], 16).ok()?,
@@ -210,7 +213,7 @@ fn parse_color(value: &str) -> Option<AnsiColor> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve, AnsiColor};
+    use super::{palette, parse_color, resolve, AnsiColor};
 
     #[test]
     fn uses_builtin_palette_and_custom_overrides() {
@@ -228,5 +231,29 @@ mod tests {
         let colors = resolve(&config);
         assert_eq!(colors.worktrees, AnsiColor::rgb(1, 2, 3));
         assert_eq!(colors.branches, AnsiColor::rgb(4, 5, 6));
+    }
+
+    #[test]
+    fn rejects_non_hex_colors_without_panicking() {
+        // Six *bytes* but not six hex digits: slicing this used to panic.
+        assert_eq!(parse_color("#aé123"), None);
+        assert_eq!(parse_color("#gggggg"), None);
+        assert_eq!(parse_color("#abc"), None);
+        assert_eq!(parse_color("#010203"), Some(AnsiColor::rgb(1, 2, 3)));
+    }
+
+    #[test]
+    fn keeps_palette_color_when_custom_override_is_invalid() {
+        let config: toml::Value = toml::from_str(
+            r##"
+            [theme]
+            name = "gruvbox"
+
+            [theme.custom]
+            accent = "#aé123"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(resolve(&config), palette("gruvbox"));
     }
 }

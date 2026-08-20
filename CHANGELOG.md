@@ -3,6 +3,19 @@
 Notable user-visible changes are recorded here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `.worktreeinclude` support: gitignored files named by that file — `.env`, a
+  local secrets file, a dependency directory — are copied into a new worktree
+  before the setup script runs, reflinked where the filesystem allows it.
+  `herdr-worktrees include` shows what a new worktree would receive, and
+  `worktree-include = false` turns it off.
+- `fetch-before-create` (default `true`): refresh the base's remote-tracking ref
+  before creating a branch from it, so new work starts from the upstream tip. A
+  failed or slow fetch falls back to the local copy instead of blocking.
+
 ## [0.2.0] - 2026-08-19
 
 ### Added

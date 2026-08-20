@@ -23,6 +23,12 @@ fn unique_dir(tag: &str) -> PathBuf {
     d
 }
 
+/// Build a config from TOML: `Config` carries private memoization state, so the
+/// file format is the only way to construct one from outside the crate.
+fn config_from(toml: &str) -> Config {
+    toml::from_str(toml).expect("test config to parse")
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -73,7 +79,7 @@ fn pure_helpers() {
     assert_eq!(model::origin_local_branch("origin/HEAD"), None);
     assert_eq!(model::origin_local_branch("upstream/feature"), None);
 
-    let h = render::render_header();
+    let h = render::render_header_with_options(true);
     assert!(h.contains("branch"));
     assert!(h.contains("worktree"));
     assert!(!render::render_header_with_options(false).contains("worktree"));
@@ -127,11 +133,7 @@ fn base_branch_shows_unpushed_commits_without_attributing_them_to_other_branches
         ],
     );
 
-    let config = Config {
-        base_branch: Some("main".to_string()),
-        github_prs: Some(false),
-        ..Config::default()
-    };
+    let config = config_from("base-branch = \"main\"\ngithub-prs = false\n");
     let engine = model::compute_all(
         scratch.to_str().unwrap(),
         &config,
@@ -212,10 +214,7 @@ fn remote_only_origin_branches_are_emitted_once_and_filtered() {
         &["update-ref", "refs/remotes/upstream/not-origin", head],
     );
 
-    let config = Config {
-        github_prs: Some(false),
-        ..Config::default()
-    };
+    let config = config_from("github-prs = false\n");
     let engine = model::compute_picker_initial(repo.to_str().unwrap(), &config, &tmp.join("state"));
     let candidates: Vec<_> = engine
         .remote_branches
@@ -276,15 +275,12 @@ echo "setting up {{ }}"
 
     let config = Config::load().unwrap();
     assert_eq!(
-        config.worktree_path_template(),
+        config.worktree_path_template("/repo"),
         "{{ repo_path }}/.wt/{{ branch | sanitize }}"
     );
     assert_eq!(config.open_mode(), "workspace");
     assert!(config.show_worktree_name());
-    let hidden_names = Config {
-        show_worktree_name: Some(false),
-        ..Config::default()
-    };
+    let hidden_names = config_from("show-worktree-name = false\n");
     assert!(!hidden_names.show_worktree_name());
     assert!(config.delete_branch());
     assert!(!config.force());
@@ -389,8 +385,7 @@ echo "setting up {{ }}"
             .worktrees
             .iter()
             .find(|w| w.branch == b)
-            .map(|w| w.sync_kind.clone())
-            .unwrap_or_default()
+            .map_or("", |w| w.sync_kind.as_str())
     };
     let sync = |b: &str| {
         engine
@@ -421,8 +416,6 @@ echo "setting up {{ }}"
     assert_eq!(engine.branches[0].changes, "—");
 
     let picker = model::render_fzf_lines(&engine, false);
-    let picker_header = render::render_picker_header();
-    assert_eq!(picker_header, render::render_header());
     assert!(!picker.contains("WORKTREES"));
     assert!(!picker.contains("BRANCHES"));
     assert_eq!(picker.lines().count(), 5);

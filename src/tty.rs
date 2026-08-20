@@ -6,6 +6,11 @@ pub fn err(msg: &str) {
     eprintln!("\x1b[31m{msg}\x1b[0m");
 }
 
+/// A non-fatal note: the operation continued despite it.
+pub fn warn(msg: &str) {
+    eprintln!("\x1b[33m{msg}\x1b[0m");
+}
+
 /// Read a single byte from the terminal without waiting for Enter and without
 /// echo. Returns `None` when stdin is not a TTY (or on any error).
 pub fn read_key() -> Option<u8> {
@@ -49,9 +54,14 @@ pub fn wait_key() {
 }
 
 /// Ask for confirmation. `ctrl-x` always confirms; otherwise a guarded prompt
-/// requires `ctrl-x` and a normal prompt accepts enter / y / Y (or an empty key
-/// when stdin is not a TTY).
+/// requires `ctrl-x` and a normal prompt accepts enter / y / Y. Without a
+/// terminal nobody can answer, so the answer is no — these prompts guard
+/// worktree removal and running setup scripts from forks.
 pub fn confirm(prompt: &str, require_force: bool) -> bool {
+    if !std::io::stdin().is_terminal() {
+        err("stdin is not a terminal; run interactively to confirm");
+        return false;
+    }
     println!("\n{prompt}");
     let key = read_key();
     println!();
@@ -61,8 +71,6 @@ pub fn confirm(prompt: &str, require_force: bool) -> bool {
     if require_force {
         return false;
     }
-    matches!(
-        key,
-        None | Some(b'\n') | Some(b'\r') | Some(b'y') | Some(b'Y')
-    )
+    // A read error yields `None`, which is a denial like any other non-answer.
+    matches!(key, Some(b'\n' | b'\r' | b'y' | b'Y'))
 }

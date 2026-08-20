@@ -5,12 +5,12 @@ use crate::config::{branch_short_name, Config};
 use crate::git;
 use crate::pr::{self, PrInfo};
 use crate::render;
-use crate::status;
+use crate::row::{self, PickerRow};
+use crate::status::{self, SyncKind, SyncStatus};
 use crate::util;
 use anyhow::Result;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,7 +29,7 @@ pub struct Worktree {
     pub changes: String,
     pub dirty: bool,
     pub sync: String,
-    pub sync_kind: String,
+    pub sync_kind: SyncKind,
     pub pr_number: Option<u32>,
     pub pr_url: Option<String>,
     pub review: String,
@@ -93,6 +93,9 @@ struct RefSnapshot {
 struct ComputeOptions {
     inspect_worktrees: bool,
     fetch_prs: bool,
+    /// Fill the PR columns from the cache alone, without starting `gh`.
+    /// Ignored when `fetch_prs` is set, which consults the cache itself.
+    cached_prs: bool,
     use_pr_cache: bool,
     exact_sync: bool,
     include_branches: bool,
@@ -102,6 +105,7 @@ impl ComputeOptions {
     const FULL: Self = Self {
         inspect_worktrees: true,
         fetch_prs: true,
+        cached_prs: false,
         use_pr_cache: true,
         exact_sync: true,
         include_branches: true,
@@ -109,6 +113,7 @@ impl ComputeOptions {
     const PICKER_INITIAL: Self = Self {
         inspect_worktrees: false,
         fetch_prs: false,
+        cached_prs: true,
         use_pr_cache: true,
         exact_sync: false,
         include_branches: true,
@@ -116,6 +121,7 @@ impl ComputeOptions {
     const REMOVE_INITIAL: Self = Self {
         inspect_worktrees: false,
         fetch_prs: false,
+        cached_prs: false,
         use_pr_cache: true,
         exact_sync: false,
         include_branches: false,
@@ -123,6 +129,7 @@ impl ComputeOptions {
     const REMOVE_SNAPSHOT: Self = Self {
         inspect_worktrees: false,
         fetch_prs: false,
+        cached_prs: false,
         use_pr_cache: true,
         exact_sync: true,
         include_branches: false,
@@ -220,7 +227,8 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
         Vec::new()
     };
 
-    let pr_heads: Vec<_> = if fetch_prs {
+    let cached_prs = options.cached_prs && github_prs;
+    let pr_heads: Vec<_> = if fetch_prs || cached_prs {
         refs.local
             .iter()
             .map(|(branch, metadata)| (branch.clone(), metadata.head.clone()))
@@ -234,96 +242,70 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
     } else {
         Vec::new()
     };
+    // Read-only: the first frame draws whatever the cache already holds, and the
+    // background refresh fills in the rest.
+    let cached_pr_info = cached_prs.then(|| {
+        pr::cached_many(
+            pr_heads.iter().map(|(branch, _)| branch.as_str()),
+            repo,
+            state_dir,
+        )
+    });
     let pr_handle = if fetch_prs {
         let repo = repo.to_string();
         let state_dir = state_dir.to_path_buf();
         let use_cache = options.use_pr_cache;
+        // Bypassing the cache means the user asked for fresh data (ctrl-r,
+        // ctrl-f, `--no-cache`), so that fetch may take longer than the one
+        // that merely redraws the list.
+        let patience = if use_cache {
+            pr::FetchPatience::Background
+        } else {
+            pr::FetchPatience::Interactive
+        };
         Some(std::thread::spawn(move || {
-            pr::fetch_many(&pr_heads, &repo, &state_dir, use_cache)
+            pr::fetch_many(&pr_heads, &repo, &state_dir, use_cache, patience)
         }))
     } else {
         None
     };
 
-    let worktrees: Vec<Worktree> = if options.inspect_worktrees && !records.is_empty() {
-        let workers = std::thread::available_parallelism()
-            .map(|count| count.get().saturating_mul(4))
-            .unwrap_or(8)
-            .clamp(1, 64)
-            .min(records.len());
-        let chunk_size = records.len().div_ceil(workers);
-        std::thread::scope(|scope| {
-            records
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    scope.spawn(|| {
-                        chunk
-                            .iter()
-                            .map(|record| {
-                                compute_one(
-                                    record,
-                                    true,
-                                    true,
-                                    repo,
-                                    &base_short,
-                                    &prefix,
-                                    refs.local.get(&record.branch),
-                                    &refs.remote_heads,
-                                    options.exact_sync,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .filter_map(|handle| handle.join().ok())
-                .flatten()
-                .collect()
-        })
-    } else {
-        records
-            .iter()
-            .map(|record| {
-                compute_one(
-                    record,
-                    true,
-                    false,
-                    repo,
-                    &base_short,
-                    &prefix,
-                    refs.local.get(&record.branch),
-                    &refs.remote_heads,
-                    options.exact_sync,
-                )
-            })
-            .collect()
-    };
+    let worktrees: Vec<Worktree> = compute_in_parallel(&records, |record| {
+        compute_one(
+            record,
+            true,
+            options.inspect_worktrees,
+            repo,
+            &base_short,
+            &prefix,
+            refs.local.get(&record.branch),
+            &refs.remote_heads,
+            options.exact_sync,
+        )
+    });
 
-    let branches: Vec<Worktree> = branch_records
-        .iter()
-        .map(|record| {
-            compute_one(
-                record,
-                false,
-                false,
-                repo,
-                &base_short,
-                &prefix,
-                refs.local.get(&record.branch),
-                &refs.remote_heads,
-                options.exact_sync,
-            )
-        })
-        .collect();
+    let branches: Vec<Worktree> = compute_in_parallel(&branch_records, |record| {
+        compute_one(
+            record,
+            false,
+            false,
+            repo,
+            &base_short,
+            &prefix,
+            refs.local.get(&record.branch),
+            &refs.remote_heads,
+            options.exact_sync,
+        )
+    });
     let remote_branches: Vec<Worktree> = remote_records
         .iter()
         .map(|(branch, metadata)| compute_remote_candidate(branch, metadata, &base_short, &prefix))
         .collect();
 
-    let prs = pr_handle
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
+    let prs = match pr_handle {
+        Some(handle) => handle.join().unwrap_or_default(),
+        None => cached_pr_info.unwrap_or_default(),
+    };
     let mut worktrees = worktrees;
     let mut branches = branches;
     let mut remote_branches = remote_branches;
@@ -359,6 +341,20 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
         branches,
         remote_branches,
     }
+}
+
+/// Map `compute` over `items`, preserving order. Every entry costs at least one
+/// `git` process, so the work is latency- rather than CPU-bound and
+/// oversubscribing the cores pays off. A panicking entry drops out of the list
+/// rather than taking the picker down with it.
+fn compute_in_parallel<T: Sync, R: Send>(items: &[T], compute: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let workers = std::thread::available_parallelism()
+        .map_or(8, |count| count.get().saturating_mul(4))
+        .clamp(1, 64);
+    util::parallel_map(items, workers, compute)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn ref_snapshot(repo: &str, exact_sync: bool) -> RefSnapshot {
@@ -425,51 +421,18 @@ pub fn origin_local_branch(remote: &str) -> Option<&str> {
     (!branch.is_empty() && branch != "HEAD" && !branch.starts_with('-')).then_some(branch)
 }
 
+/// Apply the shared base-ref ladder to an already-loaded ref snapshot, so the
+/// engine resolves the base without spawning one `git rev-parse` per candidate.
 fn resolve_base_ref(config: &Config, refs: &RefSnapshot, current_branch: &str) -> String {
-    if let Some(configured) = config
-        .base_branch
-        .as_deref()
-        .filter(|name| !name.is_empty())
-    {
-        if refs
-            .remote_heads
-            .contains_key(&format!("refs/remotes/origin/{configured}"))
-        {
-            return format!("origin/{configured}");
-        }
-        if refs.local.contains_key(configured) {
-            return configured.to_string();
-        }
-    }
-
-    if let Some(remote) = refs.origin_head.as_deref() {
-        if refs.remote_heads.contains_key(remote) {
-            return remote
-                .strip_prefix("refs/remotes/")
-                .unwrap_or(remote)
-                .to_string();
-        }
-        if let Some(local) = remote.strip_prefix("refs/remotes/origin/") {
-            if refs.local.contains_key(local) {
-                return local.to_string();
-            }
-        }
-    }
-
-    for candidate in ["main", "master"] {
-        if refs
-            .remote_heads
-            .contains_key(&format!("refs/remotes/origin/{candidate}"))
-        {
-            return format!("origin/{candidate}");
-        }
-    }
-    for candidate in ["main", "master"] {
-        if refs.local.contains_key(candidate) {
-            return candidate.to_string();
-        }
-    }
-    current_branch.to_string()
+    git::base_ref_policy(
+        config,
+        current_branch,
+        |refname| match refname.strip_prefix("refs/heads/") {
+            Some(branch) => refs.local.contains_key(branch),
+            None => refs.remote_heads.contains_key(refname),
+        },
+        || refs.origin_head.clone(),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -489,14 +452,15 @@ fn compute_one(
     } else {
         0.0
     };
-    let when_ts = metadata
-        .map(|metadata| metadata.when_ts)
-        .unwrap_or_else(|| {
+    let when_ts = metadata.map_or_else(
+        || {
             git::git_stdout(&["-C", repo, "log", "-1", "--format=%ct", &wt.head])
                 .trim()
                 .parse()
                 .unwrap_or(0)
-        });
+        },
+        |metadata| metadata.when_ts,
+    );
     let when = render::relative_age(when_ts);
     let (staged, unstaged, changes, dirty) = if !checked_out {
         (0, 0, "—".to_string(), false)
@@ -516,11 +480,10 @@ fn compute_one(
     let detached = wt.branch.is_empty();
     let is_base = !detached && wt.branch == base_short;
 
-    let (sync, sync_kind) = if detached {
-        ("—".to_string(), "detached".to_string())
+    let sync = if detached {
+        SyncStatus::new(SyncKind::Detached, "—")
     } else {
-        let (kind, text) = compute_sync(wt, metadata, remote_heads, repo, exact_sync);
-        (text, kind)
+        compute_sync(wt, metadata, remote_heads, repo, exact_sync)
     };
 
     Worktree {
@@ -541,8 +504,8 @@ fn compute_one(
         unstaged,
         changes,
         dirty,
-        sync,
-        sync_kind,
+        sync: sync.display,
+        sync_kind: sync.kind,
         pr_number: None,
         pr_url: None,
         review: "—".to_string(),
@@ -573,8 +536,8 @@ fn compute_remote_candidate(
         unstaged: 0,
         changes: "—".to_string(),
         dirty: false,
-        sync: "remote".to_string(),
-        sync_kind: "remote".to_string(),
+        sync: SyncKind::Remote.as_str().to_string(),
+        sync_kind: SyncKind::Remote,
         pr_number: None,
         pr_url: None,
         review: "—".to_string(),
@@ -590,7 +553,7 @@ fn compute_sync(
     remote_heads: &HashMap<String, String>,
     repo: &str,
     exact_sync: bool,
-) -> (String, String) {
+) -> SyncStatus {
     let Some(metadata) = metadata else {
         let upstream = git::branch_upstream(repo, &wt.branch);
         return status::compute_sync(&wt.branch, upstream.as_deref(), repo);
@@ -598,7 +561,7 @@ fn compute_sync(
 
     if !metadata.upstream.is_empty() {
         if !exact_sync {
-            return ("loading".to_string(), "…".to_string());
+            return loading();
         }
         return status::sync_from_tracking(&metadata.tracking)
             .unwrap_or_else(|| status::compute_sync(&wt.branch, Some(&metadata.upstream), repo));
@@ -612,9 +575,14 @@ fn compute_sync(
         return status::sync_from_tracking("").expect("empty tracking state is valid");
     }
     if !exact_sync {
-        return ("loading".to_string(), "…".to_string());
+        return loading();
     }
     status::compute_sync_existing(&wt.branch, &format!("origin/{}", wt.branch), repo)
+}
+
+/// The placeholder shown until the background reload computes exact counts.
+fn loading() -> SyncStatus {
+    SyncStatus::new(SyncKind::Loading, "…")
 }
 
 fn apply_pr(worktree: &mut Worktree, pr: Option<&PrInfo>) {
@@ -624,8 +592,9 @@ fn apply_pr(worktree: &mut Worktree, pr: Option<&PrInfo>) {
     worktree.threads = threads_display(pr);
     worktree.conflict = pr.map(|pr| pr.conflict).unwrap_or(false);
     if pr.is_some_and(|pr| pr.merged && pr.head_oid.as_deref() == Some(worktree.head.as_str())) {
-        worktree.sync = "merged".to_string();
-        worktree.sync_kind = "merged".to_string();
+        let merged = SyncStatus::named(SyncKind::Merged);
+        worktree.sync = merged.display;
+        worktree.sync_kind = merged.kind;
     }
 }
 
@@ -683,80 +652,27 @@ fn git_status_counts(path: &str, include_untracked: bool) -> (u32, u32) {
     status_counts(&git::git_stdout(&args))
 }
 
+/// The picker has no room for a third number, so untracked files join the
+/// unstaged column.
 fn status_counts(out: &str) -> (u32, u32) {
-    let mut staged = 0u32;
-    let mut unstaged = 0u32;
-    for line in out.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let bytes = line.as_bytes();
-        let x = bytes[0] as char;
-        let y = if bytes.len() > 1 {
-            bytes[1] as char
-        } else {
-            ' '
-        };
-        if matches!(x, 'M' | 'A' | 'D' | 'R' | 'C') {
-            staged += 1;
-        }
-        if matches!(y, 'M' | 'D') {
-            unstaged += 1;
-        }
-        if x == '?' && y == '?' {
-            unstaged += 1;
-        }
-    }
-    (staged, unstaged)
+    let counts = status::parse_porcelain(out.as_bytes());
+    (counts.staged, counts.unstaged + counts.untracked)
 }
 
-/// True if the worktree has any uncommitted changes (tracked or untracked).
-/// Used at delete time for a precise dirty check; the picker list itself uses
-/// the fast tracked-only status above.
-pub fn worktree_dirty(path: &str) -> bool {
-    worktree_dirty_checked(path).unwrap_or(true)
-}
-
-/// Checked variant for destructive actions. Git failures are errors rather
-/// than an empty status that could be mistaken for a clean worktree.
-pub fn worktree_dirty_checked(path: &str) -> Result<bool> {
-    let output = git::git_output(&[
-        "--no-optional-locks",
-        "-C",
-        path,
-        "status",
-        "--porcelain",
-        "--untracked-files=normal",
-        "--ignore-submodules=none",
-    ])?;
-    if !output.status.success() {
-        anyhow::bail!("git status failed for {path}");
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let (staged, unstaged) = status_counts(&text);
-    Ok(staged > 0 || unstaged > 0)
-}
-
-/// 1-based item index of `path` (field 2) in the fzf list, for pre-selection.
+/// 1-based item index of the row for `path` in the fzf list, for pre-selection.
 pub fn fzf_line_index(list: &str, path: &str) -> Option<usize> {
     let items: Box<dyn Iterator<Item = &str>> = if list.contains('\0') {
         Box::new(list.split_terminator('\0'))
     } else {
         Box::new(list.lines())
     };
-    for (i, line) in items.enumerate() {
-        let mut it = line.split('\t');
-        it.next();
-        if it.next() == Some(path) {
-            return Some(i + 1);
-        }
-    }
-    None
+    items
+        .enumerate()
+        .find(|(_index, line)| line.split('\t').nth(1) == Some(path))
+        .map(|(index, _line)| index + 1)
 }
 
-/// Render the picker list (6 tab-separated fields per line).
-///
-/// Fields are branch, path, entry kind, sync kind, changes, and display.
+/// Render the picker list, one [`PickerRow`] per line.
 pub fn render_fzf_lines(engine: &Engine, skip_detached: bool) -> String {
     let row_count = engine.worktrees.len() + engine.branches.len() + engine.remote_branches.len();
     let mut out = String::with_capacity(row_count * 192);
@@ -767,7 +683,7 @@ pub fn render_fzf_lines(engine: &Engine, skip_detached: bool) -> String {
         push_fzf_row(
             &mut out,
             wt,
-            "worktree",
+            row::KIND_WORKTREE,
             &engine.prefix,
             engine.show_worktree_name,
         );
@@ -776,7 +692,7 @@ pub fn render_fzf_lines(engine: &Engine, skip_detached: bool) -> String {
         push_fzf_row(
             &mut out,
             branch,
-            "branch",
+            row::KIND_BRANCH,
             &engine.prefix,
             engine.show_worktree_name,
         );
@@ -786,7 +702,7 @@ pub fn render_fzf_lines(engine: &Engine, skip_detached: bool) -> String {
         push_fzf_row(
             &mut out,
             branch,
-            "remote",
+            row::KIND_REMOTE,
             remote_prefix.as_deref().unwrap_or_default(),
             engine.show_worktree_name,
         );
@@ -806,13 +722,16 @@ fn push_fzf_row(
     } else {
         &wt.branch
     };
-    let row = render::render_picker_row_with_options(branch_disp, wt, prefix, show_worktree_name);
-    writeln!(
-        out,
-        "{branch_disp}\t{}\t{entry_kind}\t{}\t{}\t{row}",
-        wt.path, wt.sync_kind, wt.changes
-    )
-    .expect("writing to a String cannot fail");
+    let display = render::render_row_with_options(branch_disp, wt, prefix, show_worktree_name);
+    PickerRow {
+        branch: branch_disp,
+        path: &wt.path,
+        entry_kind,
+        sync_kind: wt.sync_kind.as_str(),
+        changes: &wt.changes,
+        display: &display,
+    }
+    .write_line(out);
 }
 
 /// The `--json` / `--fzf` / `--header` data-engine entry point.
@@ -856,4 +775,34 @@ pub fn run_engine(args: &[String]) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::status_counts;
+
+    #[test]
+    fn counts_staged_unstaged_and_untracked_porcelain_codes() {
+        assert_eq!(status_counts(""), (0, 0));
+        assert_eq!(status_counts("M  a\n M b\n?? c\n"), (1, 2));
+        assert_eq!(status_counts("MM a\n"), (1, 1));
+        assert_eq!(status_counts("R  old -> new\n"), (1, 0));
+    }
+
+    #[test]
+    fn counts_unmerged_and_typechange_paths_as_work_in_progress() {
+        // A conflicted worktree must never render as clean.
+        for line in ["UU a\n", "AA a\n", "DD a\n", "AU a\n", "UD a\n", "UA a\n"] {
+            assert_eq!(status_counts(line), (0, 1), "unmerged line {line:?}");
+        }
+        assert_eq!(status_counts("T  a\n"), (1, 0));
+        assert_eq!(status_counts(" T a\n"), (0, 1));
+        assert_eq!(status_counts("TT a\n"), (1, 1));
+    }
+
+    /// The picker's column has no place for untracked files of its own.
+    #[test]
+    fn untracked_files_join_the_unstaged_count() {
+        assert_eq!(status_counts("?? a\n?? b\n"), (0, 2));
+    }
 }

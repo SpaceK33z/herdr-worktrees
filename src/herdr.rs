@@ -1,13 +1,18 @@
 //! Helpers for calling back into Herdr through the CLI.
 
 use serde_json::Value;
+use std::ffi::OsStr;
 
 fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
 }
 
 /// Run a herdr command with inherited stdio; stream output through, ignore failure.
-pub fn run(args: &[String]) {
+pub fn run<I, S>(args: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let _ = std::process::Command::new(herdr_bin()).args(args).status();
 }
 
@@ -29,7 +34,11 @@ pub fn notify(title: &str, body: &str, sound: &str) {
 }
 
 /// Run a herdr command and return its parsed JSON on success.
-pub fn json(args: &[&str]) -> Option<Value> {
+pub fn json<I, S>(args: I) -> Option<Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let out = std::process::Command::new(herdr_bin())
         .args(args)
         .output()
@@ -57,20 +66,14 @@ pub fn split_pane(target: &str, cwd: &str, envs: &[(String, String)]) -> Option<
         args.push("--env".into());
         args.push(format!("{k}={v}"));
     }
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    json(&refs)?["result"]["pane"]["pane_id"]
+    json(&args)?["result"]["pane"]["pane_id"]
         .as_str()
         .map(String::from)
 }
 
 /// Run a command in a pane (typed into its shell, then Enter).
 pub fn run_in_pane(pane: &str, cmd: &str) {
-    run(&[
-        "pane".into(),
-        "run".into(),
-        pane.to_string(),
-        cmd.to_string(),
-    ]);
+    run(["pane", "run", pane, cmd]);
 }
 
 /// Open a worktree checkout as a workspace and return its root pane id.
@@ -81,23 +84,19 @@ pub fn open_worktree_pane(
     label: &str,
 ) -> Option<String> {
     let mut args: Vec<String> = vec!["worktree".into(), "open".into()];
-    match root_ws {
-        Some(ws) => {
-            args.push("--workspace".into());
-            args.push(ws.to_string());
-        }
-        None => {
-            args.push("--cwd".into());
-            args.push(repo.to_string());
-        }
+    if let Some(ws) = root_ws {
+        args.push("--workspace".into());
+        args.push(ws.to_string());
+    } else {
+        args.push("--cwd".into());
+        args.push(repo.to_string());
     }
     args.push("--path".into());
     args.push(path.to_string());
     args.push("--label".into());
     args.push(label.to_string());
     args.push("--focus".into());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    json(&refs)?["result"]["root_pane"]["pane_id"]
+    json(&args)?["result"]["root_pane"]["pane_id"]
         .as_str()
         .map(String::from)
 }
@@ -114,22 +113,21 @@ pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str) -> Option<String
     args.push("--label".into());
     args.push(label.to_string());
     args.push("--focus".into());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    json(&refs)?["result"]["root_pane"]["pane_id"]
+    json(&args)?["result"]["root_pane"]["pane_id"]
         .as_str()
         .map(String::from)
 }
 
 /// The repo's root workspace id (for `herdr worktree open`).
 pub fn root_workspace(repo: &str) -> Option<String> {
-    json(&["worktree", "list", "--cwd", repo])?["result"]["source"]["source_workspace_id"]
+    json(["worktree", "list", "--cwd", repo])?["result"]["source"]["source_workspace_id"]
         .as_str()
         .map(String::from)
 }
 
 /// The open workspace id for a checkout, if any.
 pub fn worktree_workspace_id(path: &str, repo: &str) -> Option<String> {
-    let v = json(&["worktree", "list", "--cwd", repo])?;
+    let v = json(["worktree", "list", "--cwd", repo])?;
     for wt in v["result"]["worktrees"].as_array()? {
         if wt["path"].as_str() == Some(path) {
             if let Some(id) = wt["open_workspace_id"].as_str() {
@@ -163,7 +161,7 @@ pub fn current_workspace() -> Option<String> {
             return Some(ws);
         }
     }
-    json(&["pane", "current"])?["result"]["pane"]["workspace_id"]
+    json(["pane", "current"])?["result"]["pane"]["workspace_id"]
         .as_str()
         .map(String::from)
 }

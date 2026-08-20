@@ -80,7 +80,8 @@ Press `prefix+w` in a Git workspace to open the picker.
 | `tab` / `shift-tab` | Select or deselect worktrees in the removal picker. |
 | `ctrl-p` | Open the highlighted branch's pull request. |
 | `ctrl-d` | Remove the highlighted worktree from the main picker. |
-| `ctrl-r` | Recompute local and remote-tracking metadata. |
+| `ctrl-r` | Recompute local and remote-tracking metadata, bypassing the GitHub cache. |
+| `ctrl-f` | Run `git fetch origin`, then recompute everything against the updated remote-tracking refs. |
 | `esc` | Close the popup without changing the layout. |
 
 ## What the picker shows
@@ -130,9 +131,11 @@ remote discovery does not start one Git process per row. A `…` in **changes** 
 
 Pull request columns and the `merged` state require `github-prs = true`, a
 GitHub remote, and an authenticated `gh` CLI. GitHub results are cached for 60
-seconds. The dim footer timestamp shows when GitHub data was last fetched;
-`ctrl-r` updates it after a successful refresh. Pull counts use local
-remote-tracking refs; run `git fetch` when you need current remote state.
+seconds: opening the picker reuses a cached entry that is still fresh, while
+`ctrl-r` and `ctrl-f` always fetch. The dim footer timestamp shows when GitHub
+data was last fetched, and reads `GitHub: failed` when the last fetch could not
+reach GitHub. Pull counts use local remote-tracking refs; press `ctrl-f` when
+you need current remote state.
 
 ## Creating a worktree
 
@@ -140,12 +143,17 @@ Type a branch name and select the **create worktree** row to create that exact
 query even when existing entries fuzzy-match it. `ctrl-n` remains a direct
 shortcut for the same operation. The plugin then:
 
-1. Applies `branch-prefix` and resolves `worktree-path`.
-2. Runs `git worktree add` from the configured base, the remote HEAD, `main` or
+1. Applies `branch-prefix` and resolves `worktree-path` (detected from the repo
+   when unset — see [Auto-detection](#auto-detection)).
+2. Refreshes the base when it is a remote-tracking branch, so the new branch
+   starts from the current upstream tip (see [Fetching the
+   base](#fetching-the-base)).
+3. Runs `git worktree add` from the configured base, the remote HEAD, `main` or
    `master`, or the current branch (in that order).
-3. Opens the checkout in Herdr as a nested workspace or tab, depending on
+4. Opens the checkout in Herdr as a nested workspace or tab, depending on
    `open-mode`.
-4. Runs `[pre-start].setup-worktree` asynchronously in the new checkout.
+5. Copies the files named by `.worktreeinclude`, then runs
+   `[pre-start].setup-worktree` asynchronously in the new checkout.
 
 For an existing remote-only row, the remote branch name is used as-is: the
 plugin does not apply `branch-prefix`. For example, selecting `origin/topic`
@@ -155,6 +163,27 @@ keeps the usual prefix-aware `branch_short` path behavior.
 The setup script receives `WORKTREE_PATH`, `WORKTREE_BRANCH`, `REPO_PATH`, and
 `BASE_BRANCH`. A non-zero exit leaves the worktree in place and reports the
 script output instead of silently continuing.
+
+### Fetching the base
+
+New branches are created from `origin/<base>`, which is only as current as the
+last fetch. Before creating one, the plugin runs a targeted
+`git fetch <remote> <base>` so the branch starts from the upstream tip:
+
+```toml
+fetch-before-create = true    # refresh origin/<base> before creating a branch
+```
+
+- The fetch is best effort. If the remote is unreachable, rejects the fetch, or
+  takes longer than 10 seconds, the plugin says so and creates the branch from
+  the local copy anyway.
+- Only the base branch is fetched, without tags — not the whole remote.
+- It is skipped when the base is a local branch, when the branch already exists
+  locally (nothing is created from the base then), and for `--dry-run`.
+- Set `fetch-before-create = false` to keep creation entirely offline.
+
+Checking out an existing remote branch or pull request always fetches that ref,
+independent of this setting.
 
 ### Branch prefixes
 
@@ -171,6 +200,43 @@ branch-prefix = "u/{{ user }}/"
 - Filtering ignores the prefix, so `parser` still matches `kees/parser-fix`.
 - `worktree-path` can use `{{ branch }}` or the unprefixed
   `{{ branch_short }}`.
+
+## Carrying gitignored files over
+
+A worktree is a fresh checkout, so gitignored files a project needs to run —
+`.env`, a local secrets file, a warm dependency directory — are not in it. Add a
+`.worktreeinclude` file to the repo root, in `.gitignore` syntax, naming what to
+carry over:
+
+```text
+.env
+.env.local
+config/secrets.json
+node_modules/
+```
+
+An entry is copied only when it is **both** named by that file **and** ignored by
+git, so tracked files are never duplicated. Without the file nothing is copied.
+The same convention is read by [Claude Code](https://code.claude.com/docs/en/worktrees)
+and [Worktrunk](https://worktrunk.dev), so one file serves all
+three.
+
+- Files land before `[pre-start].setup-worktree` runs, so the script can rely on
+  a copied `.env`.
+- git does the matching, so anchoring, `**`, and negation work as they do in
+  `.gitignore`.
+- Existing files in the new worktree are left alone; a directory that holds
+  another checkout is skipped.
+- Copies are reflinked where the filesystem supports it (APFS, Btrfs), so
+  carrying a large dependency directory over costs neither time nor disk until
+  something in it is written.
+- Set `worktree-include = false` to ignore the file, globally or per repository.
+
+To see what a new worktree would receive:
+
+```bash
+"$(herdr plugin dir worktrees)/target/release/herdr-worktrees" include
+```
 
 ## Checking out a pull request
 
@@ -232,7 +298,10 @@ base-branch = "main"          # fallback: remote HEAD, main/master, current bran
 branch-prefix = ""            # for example, "kees/"
 open-mode = "workspace"       # "workspace" or "tab"
 github-prs = false            # PR, review threads, conflict, and merged state
+auto-detect = true            # infer unset settings from the repo (see below)
 pr-checkout = true            # checkout a PR by typing its number
+worktree-include = true       # copy .worktreeinclude entries into new worktrees
+fetch-before-create = true    # refresh origin/<base> before creating a branch
 show-worktree-name = true     # show the worktree directory name column
 
 [popup]
@@ -261,6 +330,49 @@ every invocation; no reload is needed.
 
 The shape intentionally follows `~/.config/worktrunk/config.toml`, so existing
 Worktrunk path and setup settings can be copied with little adjustment.
+
+### Per-repository settings
+
+Any top-level setting can be overridden per repository. Keys match the remote
+(`host/owner/repo`, `owner/repo`, or just the repo name) or the absolute path of
+the main worktree; the most specific matching key wins.
+
+```toml
+worktree-path = "{{ repo_path }}/.worktrees/{{ branch | sanitize }}"
+
+[projects."github.com/acme/monolith"]
+worktree-path = "/scratch/monolith/{{ branch | sanitize }}"
+base-branch = "develop"
+
+[projects."/home/dev/experiments"]
+branch-prefix = ""
+```
+
+### Auto-detection
+
+With no `worktree-path` set, the plugin looks for a layout the repo has already
+declared, so worktrees land where the rest of your tooling puts them. Sources,
+most authoritative first:
+
+| Source | Read from |
+| --- | --- |
+| `worktrunk` | `$WORKTRUNK_WORKTREE_PATH`, `<repo>/.config/wt.toml`, `~/.config/worktrunk/config.toml` (including its `[projects."…"]` tables) |
+| `gwq` | `<repo>/.gwq.toml`, `~/.config/gwq/config.toml` (`[[repository_settings]]`, `worktree.basedir`, `naming.template`) |
+| `phantom` | `git config phantom.worktreesDirectory`, `<repo>/phantom.config.json` |
+| `ccmanager` | `~/.config/ccmanager/config.json` |
+| `observed` | the layout the repo's existing worktrees already follow |
+| `gitignore` | an ignored `.worktrees/`, `worktrees/`, `.wt/` or `.claude/worktrees/` |
+
+Foreign templates are only adopted when they can be reproduced exactly; one that
+uses a variable or filter this plugin cannot render is skipped rather than
+approximated. Nothing is detected when `worktree-path` is set, and
+`auto-detect = false` turns it off entirely.
+
+To see what was found and what won:
+
+```bash
+"$(herdr plugin dir worktrees)/target/release/herdr-worktrees" detect
+```
 
 ## Update or uninstall
 

@@ -1,6 +1,7 @@
 //! Column layout and display rendering for the fzf list.
 
 use crate::model::Worktree;
+use crate::status::SyncKind;
 use std::path::Path;
 
 pub const COL_BRANCH: usize = 32;
@@ -57,13 +58,17 @@ pub fn branch_cell(branch: &str, width: usize, prefix: &str) -> String {
     }
 }
 
-pub fn sync_colored(s: &str, kind: &str) -> String {
+pub fn sync_colored(s: &str, kind: SyncKind) -> String {
     let color = match kind {
-        "merged" => "32",
-        "ahead" => "33",
-        "behind" | "gone" => "31",
-        "diverged" => "35",
-        _ => "2",
+        SyncKind::Merged => "32",
+        SyncKind::Ahead => "33",
+        SyncKind::Behind | SyncKind::Gone => "31",
+        SyncKind::Diverged => "35",
+        SyncKind::Synced
+        | SyncKind::Local
+        | SyncKind::Detached
+        | SyncKind::Remote
+        | SyncKind::Loading => "2",
     };
     format!("\x1b[{color}m{s}\x1b[0m")
 }
@@ -81,10 +86,6 @@ pub fn worktree_name(path: &str) -> String {
 }
 
 /// One display line: branch, optional worktree name, PR, review, unresolved threads, conflict, when, changes, sync.
-pub fn render_row(branch_disp: &str, wt: &Worktree, prefix: &str) -> String {
-    render_row_with_options(branch_disp, wt, prefix, true)
-}
-
 pub fn render_row_with_options(
     branch_disp: &str,
     wt: &Worktree,
@@ -95,28 +96,6 @@ pub fn render_row_with_options(
     render_cells(branch, wt, show_worktree_name)
 }
 
-pub fn render_picker_row(branch_disp: &str, wt: &Worktree, prefix: &str) -> String {
-    render_picker_row_with_options(branch_disp, wt, prefix, true)
-}
-
-pub fn render_picker_row_with_options(
-    branch_disp: &str,
-    wt: &Worktree,
-    prefix: &str,
-    show_worktree_name: bool,
-) -> String {
-    let branch = branch_cell(branch_disp, COL_BRANCH, prefix);
-    render_cells(branch, wt, show_worktree_name)
-}
-
-pub fn render_picker_header() -> String {
-    render_picker_header_with_options(true)
-}
-
-pub fn render_picker_header_with_options(show_worktree_name: bool) -> String {
-    render_header_with_options(show_worktree_name)
-}
-
 fn render_cells(branch: String, wt: &Worktree, show_worktree_name: bool) -> String {
     let worktree = show_worktree_name.then(|| pad(&worktree_name(&wt.path), COL_WORKTREE));
     let pr = pr_cell(wt.pr_number, wt.pr_url.as_deref(), COL_PR);
@@ -125,7 +104,7 @@ fn render_cells(branch: String, wt: &Worktree, show_worktree_name: bool) -> Stri
     let conflict = conflict_cell(wt.conflict, COL_CONFLICT);
     let when = pad(&wt.when, COL_WHEN);
     let changes = pad(&wt.changes, COL_CHANGES);
-    let sync = sync_colored(&trunc(&wt.sync, COL_SYNC), &wt.sync_kind);
+    let sync = sync_colored(&trunc(&wt.sync, COL_SYNC), wt.sync_kind);
     match worktree {
         Some(worktree) => {
             format!("{branch}  {worktree}  {pr}  {review}  {threads}  {conflict}  {when}  {changes}  {sync}")
@@ -191,11 +170,7 @@ fn conflict_cell(conflict: bool, width: usize) -> String {
     }
 }
 
-/// Column labels aligned to `render_row` (fzf reserves the pointer column).
-pub fn render_header() -> String {
-    render_header_with_options(true)
-}
-
+/// Column labels aligned to `render_row_with_options` (fzf reserves the pointer column).
 pub fn render_header_with_options(show_worktree_name: bool) -> String {
     let worktree = show_worktree_name.then(|| pad("worktree", COL_WORKTREE));
     match worktree {
@@ -234,20 +209,22 @@ pub fn relative_age(ts: i64) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    // Thresholds are in seconds: an hour, a day, a week, an average Gregorian
+    // month (30.4375 days) and year (365.25 days).
     let delta = now - ts;
     if delta < 60 {
         "now".to_string()
-    } else if delta < 3600 {
+    } else if delta < 3_600 {
         format!("{}m", delta / 60)
-    } else if delta < 86400 {
-        format!("{}h", delta / 3600)
-    } else if delta < 604800 {
-        format!("{}d", delta / 86400)
-    } else if delta < 2629800 {
-        format!("{}w", delta / 604800)
-    } else if delta < 31557600 {
-        format!("{}mo", delta / 2629800)
+    } else if delta < 86_400 {
+        format!("{}h", delta / 3_600)
+    } else if delta < 604_800 {
+        format!("{}d", delta / 86_400)
+    } else if delta < 2_629_800 {
+        format!("{}w", delta / 604_800)
+    } else if delta < 31_557_600 {
+        format!("{}mo", delta / 2_629_800)
     } else {
-        format!("{}y", delta / 31557600)
+        format!("{}y", delta / 31_557_600)
     }
 }

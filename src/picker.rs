@@ -12,10 +12,11 @@ use crate::setup;
 use crate::tty;
 use crate::util;
 use anyhow::{bail, Context as _, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut base_mode = false;
@@ -81,20 +82,14 @@ pub fn run(args: &[String]) -> Result<()> {
             if let Some(sel) = &fzf_out.selection {
                 let parts: Vec<&str> = sel.split('\t').collect();
                 if parts.len() >= 2 {
-                    let del_branch = parts[0].to_string();
-                    let del_path = parts[1].to_string();
+                    let del_branch = parts[0];
+                    let del_path = parts[1];
                     let entry_kind = parts.get(2).copied().unwrap_or("");
-                    let del_kind = parts.get(3).copied().unwrap_or("").to_string();
-                    let del_changes = parts.get(4).copied().unwrap_or("").to_string();
-                    if entry_kind == "worktree" && !del_path.is_empty() && del_path != repo {
-                        let _ = remove::delete_worktree(
-                            &del_branch,
-                            &del_path,
-                            &del_kind,
-                            &del_changes,
-                            &config,
-                            &repo,
-                        );
+                    if entry_route(entry_kind) == EntryRoute::Worktree
+                        && !del_path.is_empty()
+                        && del_path != repo
+                    {
+                        let _ = remove::delete_worktree(del_branch, del_path, &config, &repo);
                     }
                 }
             }
@@ -230,13 +225,19 @@ fn selected_creation_target<'a>(
 const MAIN_FZF_SEARCH_ARGS: &[&str] = &["--disabled", "--no-tac"];
 const INTERNAL_FZF_FILTER_ARGS: &[&str] =
     &["--no-extended", "--ansi", "--delimiter=\t", "--with-nth=6"];
-const PICKER_FOOTER: &str = "\x1b[2menter\x1b[0m switch/create · \x1b[2mctrl-n\x1b[0m new · \x1b[2malt-enter\x1b[0m base… · \x1b[2mctrl-p\x1b[0m open PR · \x1b[2mctrl-d\x1b[0m delete · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mesc\x1b[0m close";
+const PICKER_FOOTER: &str = "\x1b[2menter\x1b[0m switch/create · \x1b[2mctrl-n\x1b[0m new · \x1b[2malt-enter\x1b[0m base… · \x1b[2mctrl-p\x1b[0m open PR · \x1b[2mctrl-d\x1b[0m delete · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mctrl-f\x1b[0m fetch · \x1b[2mesc\x1b[0m close";
 
-fn picker_footer(github_prs: bool, refreshed_at: Option<u128>) -> String {
+fn picker_footer(github_prs: bool, status: pr::RefreshStatus) -> String {
     if !github_prs {
         return PICKER_FOOTER.to_string();
     }
-    let refreshed = refreshed_at
+    if status.failed {
+        // Empty PR columns after a failed fetch otherwise read as "no pull
+        // requests"; this is the only place the user can learn otherwise.
+        return format!("{PICKER_FOOTER} · \x1b[31mGitHub: failed — check gh auth\x1b[0m");
+    }
+    let refreshed = status
+        .refreshed_at
         .map(|timestamp| render::relative_age((timestamp / 1000) as i64))
         .map(|age| {
             if age == "now" {
@@ -250,10 +251,12 @@ fn picker_footer(github_prs: bool, refreshed_at: Option<u128>) -> String {
 }
 
 fn current_picker_footer(repo: &str, github_prs: bool) -> String {
-    let refreshed_at = github_prs
-        .then(|| pr::last_refresh_ms(&model::state_dir(), repo))
-        .flatten();
-    picker_footer(github_prs, refreshed_at)
+    let status = if github_prs {
+        pr::refresh_status(&model::state_dir(), repo)
+    } else {
+        pr::RefreshStatus::default()
+    };
+    picker_footer(github_prs, status)
 }
 
 pub fn run_footer(args: &[String]) -> Result<()> {
@@ -267,23 +270,43 @@ pub fn run_footer(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The helper invocations fzf runs for us, already shell-escaped.
+struct PickerCommands {
+    /// Keystroke handler: rank the last published snapshot, no Git work.
+    cached: String,
+    /// First draw: rebuild the list, reusing fresh cached GitHub data.
+    load: String,
+    /// ctrl-r: rebuild the list, bypassing the GitHub cache.
+    refresh: String,
+    /// ctrl-f: `git fetch origin`, then a cache-bypassing rebuild.
+    fetch: String,
+    footer: String,
+}
+
+impl PickerCommands {
+    fn new(exe: &str, cache: &Path) -> Self {
+        let exe = util::shell_escape(exe);
+        let cache = util::shell_escape(&cache.to_string_lossy());
+        // fzf shell-quotes placeholder values. Keep {q} unquoted so the exact
+        // query reaches each helper as one argv value, including an empty query.
+        Self {
+            cached: format!("{exe} picker-cache-list {cache} {{q}}"),
+            load: format!("{exe} picker-cache-refresh --cached {cache} {{q}}"),
+            refresh: format!("{exe} picker-cache-refresh {cache} {{q}}"),
+            fetch: format!("{exe} picker-cache-fetch {cache} {{q}}"),
+            footer: format!("{exe} picker-footer"),
+        }
+    }
+}
+
 fn run_fzf(engine: &Engine, cur_path: &str) -> Result<Option<FzfOut>> {
     let list = model::render_fzf_lines(engine, false);
-    let header = render::render_picker_header_with_options(engine.show_worktree_name);
+    let header = render::render_header_with_options(engine.show_worktree_name);
     let footer = current_picker_footer(&engine.repo_path, engine.github_prs);
 
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "herdr-worktrees".to_string());
     let cache = PickerCache::create(&list)?;
-    let escaped_exe = util::shell_escape(&exe);
-    let escaped_cache = util::shell_escape(&cache.path().to_string_lossy());
-    // fzf shell-quotes placeholder values. Keep {q} unquoted so the exact query
-    // reaches each helper as one argv value, including an empty query.
-    let cached_cmd = format!("{escaped_exe} picker-cache-list {escaped_cache} {{q}}");
-    let refresh_cmd = format!("{escaped_exe} picker-cache-refresh {escaped_cache} {{q}}");
-    let footer_cmd = format!("{escaped_exe} picker-footer");
-    let bind = build_fzf_bind(&list, cur_path, &cached_cmd, &refresh_cmd, &footer_cmd);
+    let commands = PickerCommands::new(&util::self_exe(), cache.path());
+    let bind = build_fzf_bind(&list, cur_path, &commands);
 
     let mut child = std::process::Command::new("fzf")
         .args(MAIN_FZF_SEARCH_ARGS)
@@ -327,28 +350,32 @@ fn run_fzf(engine: &Engine, cur_path: &str) -> Result<Option<FzfOut>> {
     }))
 }
 
-fn build_fzf_bind(
-    list: &str,
-    cur_path: &str,
-    cached_cmd: &str,
-    refresh_cmd: &str,
-    footer_cmd: &str,
-) -> String {
+fn build_fzf_bind(list: &str, cur_path: &str, commands: &PickerCommands) -> String {
+    let PickerCommands {
+        cached,
+        load,
+        refresh,
+        fetch,
+        footer,
+    } = commands;
     // Draw the cheap local snapshot first, then atomically replace it with the
-    // status/PR-enriched list. Git/model work only runs for load and ctrl-r.
+    // status/PR-enriched list. Git/model work only runs for load, ctrl-r and
+    // ctrl-f.
     let load_action = match model::fzf_line_index(list, cur_path) {
         Some(idx) if !cur_path.is_empty() => {
             format!(
-                "load:pos({idx})+unbind(load)+reload-sync({refresh_cmd})+transform-footer({footer_cmd})"
+                "load:pos({idx})+unbind(load)+reload-sync({load})+transform-footer({footer})"
             )
         }
-        _ => format!("load:unbind(load)+reload-sync({refresh_cmd})+transform-footer({footer_cmd})"),
+        _ => format!("load:unbind(load)+reload-sync({load})+transform-footer({footer})"),
     };
     // The main picker is search-disabled, so reload order is display order.
     // `first` only resets selection after the synchronous reload; it cannot
     // reorder the fuzzy-ranked real rows or their appended create row.
     format!(
-        "{load_action},change:reload-sync({cached_cmd})+first,ctrl-r:reload-sync({refresh_cmd})+first+transform-footer({footer_cmd})"
+        "{load_action},change:reload-sync({cached})+first,\
+         ctrl-r:reload-sync({refresh})+first+transform-footer({footer}),\
+         ctrl-f:reload-sync({fetch})+first+transform-footer({footer})"
     )
 }
 
@@ -447,7 +474,7 @@ fn render_query_aware_list(
     let mut out = restored;
     if pr_checkout {
         if let Some(number) = parse_pr_query(query) {
-            out = append_pr_row(out, number, colors);
+            out = prepend_pr_row(out, number, colors);
         }
     }
     Ok(append_create_row(out, query, colors))
@@ -565,7 +592,7 @@ fn append_create_row(
 /// Prepend the checkout-PR action row. It comes first so typing a bare number
 /// and pressing Enter deterministically checks out the PR rather than landing
 /// on a fuzzy match. Field 0 is the decimal number so `ctrl-p` opens the PR.
-fn append_pr_row(list: String, number: u32, colors: &crate::theme::ThemeColors) -> String {
+fn prepend_pr_row(list: String, number: u32, colors: &crate::theme::ThemeColors) -> String {
     let action = colors.worktrees.paint_bold("⇄ checkout pull request");
     let display = format!("#{number}  {action}");
     let mut row = String::new();
@@ -578,25 +605,8 @@ fn append_pr_row(list: String, number: u32, colors: &crate::theme::ThemeColors) 
 }
 
 fn atomic_replace_cache(path: &Path, contents: &str) -> Result<()> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp_path = unique_cache_path(directory.to_path_buf(), "refresh")?;
-    let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .with_context(|| format!("creating picker refresh {}", temp_path.display()))?;
-        file.write_all(contents.as_bytes())
-            .context("writing picker refresh")?;
-        drop(file);
-        std::fs::rename(&temp_path, path)
-            .with_context(|| format!("replacing picker cache {}", path.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
+    util::write_atomic(path, contents.as_bytes())
+        .with_context(|| format!("replacing picker cache {}", path.display()))
 }
 
 fn cache_helper_args(args: &[String]) -> Result<(&Path, &str)> {
@@ -604,6 +614,18 @@ fn cache_helper_args(args: &[String]) -> Result<(&Path, &str)> {
         bail!("picker cache helper expects <cache-path> <query>");
     };
     Ok((Path::new(cache), query))
+}
+
+/// The refresh helper takes an optional leading `--cached`: fzf's `load` event
+/// redraws on every open and may reuse fresh GitHub data, while `ctrl-r` is a
+/// deliberate request for a new fetch.
+fn refresh_helper_args(args: &[String]) -> Result<(&Path, &str, bool)> {
+    let (use_cache, rest) = match args.split_first() {
+        Some((first, rest)) if first == "--cached" => (true, rest),
+        _ => (false, args),
+    };
+    let (cache, query) = cache_helper_args(rest)?;
+    Ok((cache, query, use_cache))
 }
 
 /// Cheap fzf change handler: read the last rendered snapshot, fuzzy-rank its
@@ -625,11 +647,28 @@ pub fn run_cached_list(args: &[String]) -> Result<()> {
 /// Expensive fzf load/ctrl-r handler: rebuild the model, atomically publish the
 /// real candidate cache, then fuzzy-rank it and append the current create row.
 pub fn run_cache_refresh(args: &[String]) -> Result<()> {
+    let (cache_path, query, use_cache) = refresh_helper_args(args)?;
+    republish_cache(cache_path, query, use_cache)
+}
+
+/// ctrl-f handler: update the remote-tracking refs the sync and pull counts are
+/// computed from, then rebuild as ctrl-r does. The fetch is best effort — the
+/// list is still redrawn from local state when the remote is slow or gone.
+pub fn run_cache_fetch(args: &[String]) -> Result<()> {
     let (cache_path, query) = cache_helper_args(args)?;
+    let repo = git::repo_root()?.to_string_lossy().into_owned();
+    git::git_timeout(
+        &["-C", &repo, "fetch", "--quiet", "origin"],
+        git::FETCH_TIMEOUT,
+    );
+    republish_cache(cache_path, query, false)
+}
+
+fn republish_cache(cache_path: &Path, query: &str, use_cache: bool) -> Result<()> {
     let repo = git::repo_root()?.to_string_lossy().into_owned();
     let config = Config::load()?;
     let state_dir = model::state_dir();
-    let engine = model::compute_all(&repo, &config, &state_dir, false);
+    let engine = model::compute_all(&repo, &config, &state_dir, use_cache);
     let colors = crate::theme::ThemeColors::load();
     let refreshed = model::render_fzf_lines(&engine, false);
     atomic_replace_cache(cache_path, &refreshed)?;
@@ -777,8 +816,6 @@ fn checkout_remote_worktree(remote: &str, config: &Config, repo: &str, dry_run: 
         return;
     }
     if !add_remote_tracking_worktree(repo, &path, local_branch, remote) {
-        tty::err("git worktree add failed (see above)");
-        tty::wait_key();
         return;
     }
 
@@ -787,12 +824,15 @@ fn checkout_remote_worktree(remote: &str, config: &Config, repo: &str, dry_run: 
 
 /// Check out a GitHub pull request by number into a worktree.
 fn checkout_pr_worktree(number: u32, config: &Config, repo: &str, dry_run: bool) {
-    let Some(target) = pr::resolve_pr(number, repo) else {
-        tty::err(&format!(
-            "could not resolve pull request #{number} (requires an authenticated gh CLI)"
-        ));
-        tty::wait_key();
-        return;
+    let target = match pr::resolve_pr_detailed(number, repo) {
+        Ok(target) => target,
+        Err(error) => {
+            tty::err(&format!(
+                "could not resolve pull request #{number}: {error}"
+            ));
+            tty::wait_key();
+            return;
+        }
     };
     let branch = target.head_ref.as_str();
 
@@ -826,7 +866,7 @@ fn checkout_pr_worktree(number: u32, config: &Config, repo: &str, dry_run: bool)
     let ok = if target.is_cross_repo {
         checkout_fork_pr(&target, number, &path, branch, repo)
     } else {
-        checkout_same_repo_pr(&path, branch, repo)
+        checkout_same_repo_pr(&target, &path, branch, repo)
     };
     if !ok {
         return;
@@ -847,9 +887,12 @@ fn confirm_fork_checkout(number: u32, branch: &str) -> bool {
 
 /// Same-repository PR: reuse an existing local branch, or fetch
 /// `origin/<branch>` and create a tracking worktree from it.
-fn checkout_same_repo_pr(path: &str, branch: &str, repo: &str) -> bool {
+fn checkout_same_repo_pr(target: &pr::PullRequestTarget, path: &str, branch: &str, repo: &str) -> bool {
     if git::ref_exists(repo, &format!("refs/heads/{branch}")) {
-        return git::git_inherit(&["-C", repo, "worktree", "add", path, branch]);
+        if !reconcile_local_pr_branch(target, branch, repo) {
+            return false;
+        }
+        return worktree_add(&["-C", repo, "worktree", "add", path, branch]);
     }
 
     let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
@@ -858,7 +901,7 @@ fn checkout_same_repo_pr(path: &str, branch: &str, repo: &str) -> bool {
         tty::wait_key();
         return false;
     }
-    git::git_inherit(&[
+    worktree_add(&[
         "-C",
         repo,
         "worktree",
@@ -869,6 +912,67 @@ fn checkout_same_repo_pr(path: &str, branch: &str, repo: &str) -> bool {
         path,
         &format!("origin/{branch}"),
     ])
+}
+
+/// A local branch left over from an earlier checkout can sit behind the pull
+/// request's current head — checking it out as-is would silently present stale
+/// commits as the PR. Fast-forward it when the PR only moved ahead; refuse when
+/// the two have diverged, as the fork path does.
+fn reconcile_local_pr_branch(target: &pr::PullRequestTarget, branch: &str, repo: &str) -> bool {
+    let local_ref = format!("refs/heads/{branch}");
+    let Some(local_oid) = git::ref_oid(repo, &local_ref) else {
+        return true;
+    };
+    if local_oid == target.head_oid {
+        return true;
+    }
+
+    // The PR head may not be in this clone yet; the fetch also refreshes the
+    // remote-tracking ref the new worktree is compared against.
+    let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+    if !git::git_inherit(&["-C", repo, "fetch", "origin", &refspec])
+        || !git::ref_exists(repo, &format!("{}^{{commit}}", target.head_oid))
+    {
+        tty::err(&format!(
+            "could not fetch pull request #{} ({branch}) from origin",
+            target.number
+        ));
+        tty::wait_key();
+        return false;
+    }
+
+    if !is_ancestor(repo, &local_oid, &target.head_oid) {
+        tty::err(&format!(
+            "local branch '{branch}' has diverged from pull request #{}; not overwriting",
+            target.number
+        ));
+        tty::wait_key();
+        return false;
+    }
+
+    let prompt = format!(
+        "local branch '{branch}' is behind pull request #{}.\n\n\
+         fast-forward it to the pull request's head before checking it out?\n\n\
+         press enter to confirm · esc to keep the local commits",
+        target.number
+    );
+    if !tty::confirm(&prompt, false) {
+        return false;
+    }
+    // The old value makes this a compare-and-swap: a concurrent update aborts
+    // the fast-forward rather than discarding it.
+    git::git_inherit(&[
+        "-C",
+        repo,
+        "update-ref",
+        &local_ref,
+        &target.head_oid,
+        &local_oid,
+    ])
+}
+
+fn is_ancestor(repo: &str, ancestor: &str, descendant: &str) -> bool {
+    git::git_success(&["-C", repo, "merge-base", "--is-ancestor", ancestor, descendant])
 }
 
 /// Fork PR: fetch `refs/pull/N/head` into a temporary ref, then create a local
@@ -884,7 +988,9 @@ fn checkout_fork_pr(
     let temp_ref = format!("refs/herdr-worktrees/pr-{number}");
     let refspec = format!("refs/pull/{number}/head:{temp_ref}");
     if !git::git_inherit(&["-C", repo, "fetch", "origin", &refspec]) {
-        tty::err(&format!("could not fetch pull request #{number} from origin"));
+        tty::err(&format!(
+            "could not fetch pull request #{number} from origin"
+        ));
         tty::wait_key();
         return false;
     }
@@ -892,7 +998,7 @@ fn checkout_fork_pr(
     let local_ref = format!("refs/heads/{branch}");
     let result = if git::ref_exists(repo, &local_ref) {
         if git::ref_oid(repo, &local_ref).as_deref() == Some(target.head_oid.as_str()) {
-            git::git_inherit(&["-C", repo, "worktree", "add", path, branch])
+            worktree_add(&["-C", repo, "worktree", "add", path, branch])
         } else {
             tty::err(&format!(
                 "branch '{branch}' already exists locally at a different commit; not overwriting"
@@ -901,17 +1007,35 @@ fn checkout_fork_pr(
             false
         }
     } else {
-        git::git_inherit(&["-C", repo, "worktree", "add", "-b", branch, path, &temp_ref])
+        worktree_add(&["-C", repo, "worktree", "add", "-b", branch, path, &temp_ref])
     };
 
     let _ = git::delete_ref(repo, &temp_ref);
     result
 }
 
+/// `git worktree add` for an explicit user action: git's own diagnostics reach
+/// the pane (an existing path, a branch checked out elsewhere, a bad name), and
+/// a failure holds the popup open long enough to read them.
+fn worktree_add(args: &[&str]) -> bool {
+    if git::git_inherit(args) {
+        return true;
+    }
+    tty::err("git worktree add failed — see the error above");
+    tty::wait_key();
+    false
+}
+
 fn add_remote_tracking_worktree(repo: &str, path: &str, local: &str, remote: &str) -> bool {
-    git::git_success(&[
+    worktree_add(&[
         "-C", repo, "worktree", "add", "-b", local, "--track", path, remote,
     ])
+}
+
+/// Reject a name `git` would refuse before `git worktree add` fails on it, so
+/// the create row can say what is actually wrong.
+fn valid_branch_name(repo: &str, name: &str) -> bool {
+    git::git_success(&["-C", repo, "check-ref-format", "--branch", name])
 }
 
 fn create_worktree(
@@ -941,27 +1065,67 @@ fn create_worktree(
         return;
     }
 
-    if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
-        // branch exists but has no checkout yet -> check it out into a new worktree
-        if !git::git_success(&["worktree", "add", path.as_str(), final_branch.as_str()]) {
-            tty::err("git worktree add failed (see above)");
-            tty::wait_key();
-            return;
-        }
-    } else if !git::git_success(&[
-        "worktree",
-        "add",
-        path.as_str(),
-        "-b",
-        final_branch.as_str(),
-        base,
-    ]) {
-        tty::err("git worktree add failed (see above)");
+    if !valid_branch_name(repo, &final_branch) {
+        tty::err(&format!("'{final_branch}' is not a valid branch name"));
         tty::wait_key();
         return;
     }
 
+    // Every `worktree add` runs with `-C repo`, so a relative `worktree-path`
+    // template resolves against the repo root rather than the popup's cwd.
+    let added = if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
+        // branch exists but has no checkout yet -> check it out into a new worktree
+        worktree_add(&[
+            "-C",
+            repo,
+            "worktree",
+            "add",
+            path.as_str(),
+            final_branch.as_str(),
+        ])
+    } else {
+        // Only a brand-new branch starts from `base`, so only that path needs
+        // the base to be current.
+        refresh_base(config, repo, base);
+        worktree_add(&[
+            "-C",
+            repo,
+            "worktree",
+            "add",
+            path.as_str(),
+            "-b",
+            final_branch.as_str(),
+            base,
+        ])
+    };
+    if !added {
+        return;
+    }
+
     open_and_setup_worktree(&path, &final_branch, base, repo, config);
+}
+
+/// Refresh the base's remote-tracking ref so the new branch starts from the
+/// current upstream tip. Purely advisory: an unreachable remote, a rejected
+/// fetch, or one that outruns [`git::FETCH_TIMEOUT`] leaves the local copy in
+/// place and creation continues from it.
+fn refresh_base(config: &Config, repo: &str, base: &str) {
+    if !config.fetch_before_create() || git::remote_base_parts(repo, base).is_none() {
+        return;
+    }
+    let progress = ProgressBar::new_spinner();
+    if let Ok(style) = ProgressStyle::with_template("{spinner:.cyan} {msg}") {
+        progress.set_style(style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]));
+    }
+    progress.set_message(format!("Fetching {base}…"));
+    progress.enable_steady_tick(Duration::from_millis(80));
+    let outcome = git::fetch_base(repo, base);
+    progress.finish_and_clear();
+    if outcome == git::FetchBase::Failed {
+        tty::warn(&format!(
+            "could not fetch {base} — creating from the local copy"
+        ));
+    }
 }
 
 /// Open the checkout right away, then run setup in the existing split-pane or
@@ -969,7 +1133,7 @@ fn create_worktree(
 fn open_and_setup_worktree(path: &str, branch: &str, base: &str, repo: &str, config: &Config) {
     let shell_pane = open_worktree(path, branch, config, repo);
 
-    if config.setup_script().is_empty() {
+    if !setup::has_work(repo, config) {
         return;
     }
 
@@ -993,9 +1157,7 @@ fn open_and_setup_worktree(path: &str, branch: &str, base: &str, repo: &str, con
         spawn_setup_detached(path, branch, base, repo, config);
         return;
     };
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "herdr-worktrees".to_string());
+    let exe = util::self_exe();
     let cmd = format!(
         "{} setup-bg {} {} {} {}; exit",
         util::shell_escape(&exe),
@@ -1009,9 +1171,7 @@ fn open_and_setup_worktree(path: &str, branch: &str, base: &str, repo: &str, con
 
 /// Fallback when the split-pane path is unavailable: run setup detached.
 fn spawn_setup_detached(path: &str, branch: &str, base: &str, repo: &str, config: &Config) {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "herdr-worktrees".to_string());
+    let exe = util::self_exe();
     let log = background::log_path("setup");
     let args = [
         "setup-bg".to_string(),
@@ -1020,12 +1180,14 @@ fn spawn_setup_detached(path: &str, branch: &str, base: &str, repo: &str, config
         base.to_string(),
         repo.to_string(),
     ];
-    if background::spawn_detached(&exe, &args, &log).is_err()
-        && !setup::run_setup(path, branch, base, repo, config)
-    {
-        tty::err(&format!(
-            "setup script failed — worktree left in place at {path}"
-        ));
+    if background::spawn_detached(&exe, &args, &log).is_err() {
+        let prepared = setup::run_setup(path, branch, base, repo, config);
+        if !prepared.ok() {
+            tty::err(&format!(
+                "{} — worktree left in place at {path}",
+                prepared.summary()
+            ));
+        }
     }
 }
 
@@ -1059,10 +1221,11 @@ fn find_worktree_path(repo: &str, branch: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_remote_tracking_worktree, append_create_row, append_pr_row, atomic_replace_cache,
-        build_fzf_bind, entry_route, parse_pr_query, picker_footer, pr_head_name,
-        render_query_aware_list, restore_ranked_rows, selected_creation_target, EntryRoute,
-        PickerCache, INTERNAL_FZF_FILTER_ARGS, MAIN_FZF_SEARCH_ARGS, PICKER_FOOTER,
+        add_remote_tracking_worktree, append_create_row, atomic_replace_cache, build_fzf_bind,
+        entry_route, parse_pr_query, picker_footer, pr_head_name, prepend_pr_row,
+        refresh_helper_args, render_query_aware_list, restore_ranked_rows,
+        selected_creation_target, valid_branch_name, EntryRoute, PickerCache, PickerCommands,
+        INTERNAL_FZF_FILTER_ARGS, MAIN_FZF_SEARCH_ARGS, PICKER_FOOTER,
     };
     use std::io::Write as _;
     use std::path::PathBuf;
@@ -1135,40 +1298,86 @@ mod tests {
         );
     }
 
+    fn commands() -> PickerCommands {
+        PickerCommands::new("exe", std::path::Path::new("/tmp/cache"))
+    }
+
     #[test]
     fn enrichment_binding_keeps_initial_position_and_uses_query_aware_commands() {
         let list = "main\t/repo\tworktree\nother\t/wt\tworktree\n";
-        let bind = build_fzf_bind(
-            list,
-            "/wt",
-            "picker-cache-list cache {q}",
-            "picker-cache-refresh cache {q}",
-            "picker-footer",
-        );
+        let bind = build_fzf_bind(list, "/wt", &commands());
         assert!(bind.starts_with(
-            "load:pos(2)+unbind(load)+reload-sync(picker-cache-refresh cache {q})+transform-footer(picker-footer)"
+            "load:pos(2)+unbind(load)+reload-sync('exe' picker-cache-refresh --cached '/tmp/cache' {q})+transform-footer('exe' picker-footer)"
         ));
-        assert!(bind.contains("change:reload-sync(picker-cache-list cache {q})+first"));
+        assert!(bind.contains("change:reload-sync('exe' picker-cache-list '/tmp/cache' {q})+first"));
         assert!(bind.contains(
-            "ctrl-r:reload-sync(picker-cache-refresh cache {q})+first+transform-footer(picker-footer)"
+            "ctrl-r:reload-sync('exe' picker-cache-refresh '/tmp/cache' {q})+first+transform-footer('exe' picker-footer)"
+        ));
+        assert!(bind.contains(
+            "ctrl-f:reload-sync('exe' picker-cache-fetch '/tmp/cache' {q})+first+transform-footer('exe' picker-footer)"
         ));
         assert_eq!(bind.matches("picker-cache-list").count(), 1);
-        assert_eq!(bind.matches("picker-cache-refresh").count(), 2);
-        assert_eq!(bind.matches("transform-footer").count(), 2);
+        assert_eq!(bind.matches("picker-cache-fetch").count(), 1);
+        assert_eq!(bind.matches("transform-footer").count(), 3);
+    }
+
+    /// The load event redraws on every open, so it may reuse fresh cached
+    /// GitHub data; ctrl-r and ctrl-f are deliberate requests for a new fetch.
+    #[test]
+    fn only_the_load_event_reuses_the_github_cache() {
+        let commands = commands();
+        assert!(commands.load.contains(" picker-cache-refresh --cached "));
+        assert!(!commands.refresh.contains("--cached"));
+        assert!(!commands.fetch.contains("--cached"));
+
+        let cached = ["--cached".to_string(), "cache".to_string(), "q".to_string()];
+        assert!(refresh_helper_args(&cached).unwrap().2);
+        let plain = ["cache".to_string(), "q".to_string()];
+        let (path, query, use_cache) = refresh_helper_args(&plain).unwrap();
+        assert_eq!(path, std::path::Path::new("cache"));
+        assert_eq!(query, "q");
+        assert!(!use_cache);
+        assert!(refresh_helper_args(&["cache".to_string()]).is_err());
     }
 
     #[test]
     fn github_refresh_status_is_subtle_and_optional() {
-        assert_eq!(picker_footer(false, None), PICKER_FOOTER);
-        let pending = picker_footer(true, None);
-        assert!(pending.contains("\x1b[2mGitHub: not refreshed\x1b[0m"));
+        let none = crate::pr::RefreshStatus::default();
+        assert_eq!(picker_footer(false, none), PICKER_FOOTER);
+        assert!(picker_footer(true, none).contains("\x1b[2mGitHub: not refreshed\x1b[0m"));
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis();
-        let fresh = picker_footer(true, Some(now));
+        let fresh = picker_footer(
+            true,
+            crate::pr::RefreshStatus {
+                refreshed_at: Some(now),
+                failed: false,
+            },
+        );
         assert!(fresh.contains("\x1b[2mGitHub: now\x1b[0m"));
+    }
+
+    /// A failed fetch leaves the PR columns empty, which otherwise reads as
+    /// "this repository has no pull requests".
+    #[test]
+    fn a_failed_github_fetch_is_called_out_in_the_footer() {
+        let failed = picker_footer(
+            true,
+            crate::pr::RefreshStatus {
+                refreshed_at: Some(1),
+                failed: true,
+            },
+        );
+        assert!(failed.contains("GitHub: failed — check gh auth"), "{failed}");
+        assert!(!failed.contains("ago"), "{failed}");
+    }
+
+    #[test]
+    fn footer_documents_the_fetch_binding() {
+        assert!(PICKER_FOOTER.contains("ctrl-f\x1b[0m fetch"));
     }
 
     #[test]
@@ -1295,9 +1504,9 @@ mod tests {
     }
 
     #[test]
-    fn append_pr_row_prepends_before_existing_rows() {
+    fn prepend_pr_row_puts_the_row_before_existing_rows() {
         let colors = crate::theme::ThemeColors::default();
-        let list = append_pr_row(
+        let list = prepend_pr_row(
             "branch\t/p\tbranch\tclean\tclean\tbranch\n".to_string(),
             7,
             &colors,
@@ -1311,6 +1520,27 @@ mod tests {
         assert_eq!(fields[2], "pr");
         assert!(fields[5].contains("⇄ checkout pull request"));
         assert_eq!(lines[1].split('\t').next(), Some("branch"));
+    }
+
+    /// The query box accepts anything, so a typo used to reach `git worktree
+    /// add` and fail with a bare refname error.
+    #[test]
+    fn branch_names_git_would_reject_are_caught_before_the_worktree_is_created() {
+        let repo = std::env::temp_dir().join(format!("hwt-refname-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        let repo = repo.to_string_lossy().into_owned();
+        assert!(crate::git::git_success(&["-C", &repo, "init", "--quiet"]));
+
+        assert!(valid_branch_name(&repo, "feature/x"));
+        assert!(valid_branch_name(&repo, "kees/fix-1"));
+        assert!(!valid_branch_name(&repo, "feature x"));
+        assert!(!valid_branch_name(&repo, "feature..x"));
+        assert!(!valid_branch_name(&repo, "-leading-dash"));
+        assert!(!valid_branch_name(&repo, "trailing.lock"));
+        assert!(!valid_branch_name(&repo, ""));
+
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
@@ -1332,7 +1562,9 @@ mod tests {
         let disabled = render_query_aware_list(cached, "123", &colors, false).unwrap();
         let lines: Vec<_> = disabled.lines().collect();
         assert_eq!(lines.len(), 1); // create row only, no PR row
-        assert!(lines.iter().all(|line| line.split('\t').nth(2) != Some("pr")));
+        assert!(lines
+            .iter()
+            .all(|line| line.split('\t').nth(2) != Some("pr")));
     }
 
     #[test]
