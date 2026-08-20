@@ -19,6 +19,7 @@ pub mod setup;
 pub mod status;
 pub mod theme;
 pub mod tty;
+pub mod update;
 pub mod util;
 
 use anyhow::Result;

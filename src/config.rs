@@ -10,6 +10,10 @@ use std::sync::{Arc, OnceLock};
 
 const DEFAULT_WORKTREE_PATH: &str = "{{ repo_path }}/.worktrees/{{ branch | sanitize }}";
 
+/// What the `[update] agent = "ask"` prompt offers when the config names no
+/// list of its own. Every entry is a Herdr agent kind.
+const DEFAULT_UPDATE_AGENTS: [&str; 4] = ["claude", "codex", "opencode", "pi"];
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -40,6 +44,7 @@ pub struct Config {
     pub auto_detect: Option<bool>,
     pub popup: Popup,
     pub remove: Remove,
+    pub update: Update,
     #[serde(rename = "pre-start")]
     pub pre_start: PreStart,
     /// Per-repo overrides, keyed by `host/owner/repo`, `owner/repo`, the repo
@@ -64,6 +69,25 @@ pub struct Remove {
     #[serde(rename = "delete-branch")]
     pub delete_branch: Option<bool>,
     pub force: Option<bool>,
+}
+
+/// `[update]`: how the base branch is brought into a worktree, and which agent
+/// picks up the conflicts git cannot resolve on its own.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct Update {
+    /// `merge` (default) or `rebase`.
+    pub strategy: Option<String>,
+    /// A Herdr agent kind (`claude`, `codex`, …), or `ask` (default) to choose
+    /// one each time.
+    pub agent: Option<String>,
+    /// What the `ask` prompt offers.
+    pub agents: Option<Vec<String>>,
+    /// Extra argv for an agent's executable, keyed by kind.
+    #[serde(rename = "agent-args")]
+    pub agent_args: HashMap<String, Vec<String>>,
+    /// Overrides the one-line task the agent is started with.
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -130,6 +154,15 @@ impl Config {
         pick(&mut self.popup.height, &other.popup.height);
         pick(&mut self.remove.delete_branch, &other.remove.delete_branch);
         pick(&mut self.remove.force, &other.remove.force);
+        pick(&mut self.update.strategy, &other.update.strategy);
+        pick(&mut self.update.agent, &other.update.agent);
+        pick(&mut self.update.agents, &other.update.agents);
+        pick(&mut self.update.prompt, &other.update.prompt);
+        // Argv is merged per agent kind, so a project can override how one
+        // agent launches without restating the others.
+        for (kind, args) in &other.update.agent_args {
+            self.update.agent_args.insert(kind.clone(), args.clone());
+        }
         pick(
             &mut self.pre_start.setup_worktree,
             &other.pre_start.setup_worktree,
@@ -217,6 +250,53 @@ impl Config {
                 .clone()
                 .unwrap_or_else(|| "70%".to_string()),
         )
+    }
+
+    /// The raw `[update] strategy`; [`crate::update::Strategy`] rejects a name
+    /// it does not know rather than silently picking one.
+    pub fn update_strategy(&self) -> &str {
+        self.update.strategy.as_deref().unwrap_or("merge")
+    }
+
+    /// The agent kind conflicts are handed to, or `ask` to choose each time.
+    pub fn update_agent(&self) -> &str {
+        self.update
+            .agent
+            .as_deref()
+            .filter(|agent| !agent.is_empty())
+            .unwrap_or("ask")
+    }
+
+    /// The kinds the `ask` prompt offers.
+    pub fn update_agents(&self) -> Vec<String> {
+        self.update
+            .agents
+            .clone()
+            .filter(|agents| !agents.is_empty())
+            .unwrap_or_else(|| {
+                DEFAULT_UPDATE_AGENTS
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect()
+            })
+    }
+
+    /// Extra argv for an agent's executable.
+    pub fn update_agent_args(&self, kind: &str) -> Vec<String> {
+        self.update
+            .agent_args
+            .get(kind)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The prompt template the conflict agent starts with.
+    pub fn update_prompt(&self) -> &str {
+        self.update
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or(crate::update::DEFAULT_PROMPT)
     }
 
     pub fn setup_script(&self) -> String {

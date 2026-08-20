@@ -1,5 +1,6 @@
 //! Helpers for calling back into Herdr through the CLI.
 
+use anyhow::{bail, Context as _, Result};
 use serde_json::Value;
 use std::ffi::OsStr;
 
@@ -47,6 +48,42 @@ where
         return None;
     }
     serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()
+}
+
+/// Run a herdr command that has to succeed, reporting what it printed when it
+/// does not. Used for the commands whose failure the user must hear about —
+/// starting an agent and handing it its task — rather than the best-effort
+/// calls the rest of this module makes.
+pub fn run_checked<I, S>(args: I) -> Result<Value>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect();
+    let out = std::process::Command::new(herdr_bin())
+        .args(&args)
+        .output()
+        .context("running herdr")?;
+    if !out.status.success() {
+        let detail = [&out.stderr, &out.stdout]
+            .into_iter()
+            .map(|stream| String::from_utf8_lossy(stream).trim().to_string())
+            .find(|text| !text.is_empty())
+            .unwrap_or_else(|| "no output".to_string());
+        bail!("{detail}");
+    }
+    Ok(serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap_or(Value::Null))
+}
+
+/// The first pane of a workspace, as somewhere to split from.
+pub fn first_pane(workspace: &str) -> Option<String> {
+    let panes = json(["pane", "list", "--workspace", workspace])?;
+    panes["result"]["panes"].as_array()?.first()?["pane_id"]
+        .as_str()
+        .map(String::from)
 }
 
 /// Split `target` downward (unfocused) and return the new pane id.
@@ -116,6 +153,15 @@ pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str) -> Option<String
     json(&args)?["result"]["root_pane"]["pane_id"]
         .as_str()
         .map(String::from)
+}
+
+/// Open a checkout in the configured `open-mode` and return its shell pane.
+pub fn open_checkout(mode: &str, repo: &str, path: &str, label: &str) -> Option<String> {
+    if mode == "tab" {
+        open_tab_pane(current_workspace().as_deref(), path, label)
+    } else {
+        open_worktree_pane(root_workspace(repo).as_deref(), repo, path, label)
+    }
 }
 
 /// The repo's root workspace id (for `herdr worktree open`).

@@ -11,13 +11,13 @@ use crate::render;
 use crate::row::{self, PickerRow};
 use crate::setup;
 use crate::tty;
+use crate::update;
 use crate::util;
 use anyhow::{anyhow, bail, Context as _, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn run(args: &[String]) -> Result<()> {
     let mut base_mode = false;
@@ -73,6 +73,8 @@ pub fn run(args: &[String]) -> Result<()> {
         let outcome = match fzf_out.key.as_str() {
             "ctrl-p" => open_selected_pr(selection, &repo),
             "ctrl-d" => delete_selected(selection, &context),
+            "ctrl-u" => update_selected(selection, &context, base, false),
+            "alt-u" => update_selected(selection, &context, base, true),
             "ctrl-n" => create_from_query(&context, query, base),
             "alt-enter" => create_on_picked_base(
                 &context,
@@ -143,6 +145,45 @@ fn delete_selected(selection: Option<PickerRow>, context: &PickerContext) -> Res
         remove::delete_worktree(row.branch, row.path, context.config, context.repo)?;
     }
     Ok(AfterAction::Redraw)
+}
+
+/// ctrl-u (alt-u to pick the base first): bring the base branch into the
+/// selected worktree. Only a real checkout has something to update, so every
+/// other row is a no-op that leaves the popup as it was.
+fn update_selected(
+    selection: Option<PickerRow>,
+    context: &PickerContext,
+    base: &str,
+    pick: bool,
+) -> Result<AfterAction> {
+    let Some(row) = selection
+        .filter(|row| entry_route(row.entry_kind) == EntryRoute::Worktree && !row.path.is_empty())
+    else {
+        return Ok(AfterAction::Redraw);
+    };
+    let base = if pick {
+        // Cancelling the base prompt cancels the update.
+        match pick_base(context.repo, base) {
+            Some(base) => base,
+            None => return Ok(AfterAction::Redraw),
+        }
+    } else {
+        base.to_string()
+    };
+    let outcome = update::update_worktree(
+        row.path,
+        row.branch,
+        &base,
+        context.config,
+        context.repo,
+        context.dry_run,
+    )?;
+    // A conflict hands the worktree to an agent and focuses it; staying open
+    // over that would only cover it up.
+    Ok(match outcome {
+        update::Outcome::Conflicted { .. } => AfterAction::Close,
+        _ => AfterAction::Redraw,
+    })
 }
 
 /// ctrl-n: create the typed query even when fzf highlights a fuzzy match.
@@ -266,7 +307,7 @@ fn selected_creation_target<'a>(
 const MAIN_FZF_SEARCH_ARGS: &[&str] = &["--disabled", "--no-tac"];
 const INTERNAL_FZF_FILTER_ARGS: &[&str] =
     &["--no-extended", "--ansi", row::DELIMITER, row::WITH_NTH];
-const PICKER_FOOTER: &str = "\x1b[2menter\x1b[0m switch/create · \x1b[2mctrl-n\x1b[0m new · \x1b[2malt-enter\x1b[0m base… · \x1b[2mctrl-p\x1b[0m open PR · \x1b[2mctrl-d\x1b[0m delete · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mctrl-f\x1b[0m fetch · \x1b[2mesc\x1b[0m close";
+const PICKER_FOOTER: &str = "\x1b[2menter\x1b[0m switch/create · \x1b[2mctrl-n\x1b[0m new · \x1b[2malt-enter\x1b[0m base… · \x1b[2mctrl-u\x1b[0m update · \x1b[2mctrl-p\x1b[0m open PR · \x1b[2mctrl-d\x1b[0m delete · \x1b[2mctrl-r\x1b[0m refresh · \x1b[2mctrl-f\x1b[0m fetch · \x1b[2mesc\x1b[0m close";
 
 fn picker_footer(github_prs: bool, status: pr::RefreshStatus) -> String {
     if !github_prs {
@@ -353,7 +394,7 @@ fn run_fzf(engine: &Engine, cur_path: &str) -> Result<Option<FzfOut>> {
         .args(MAIN_FZF_SEARCH_ARGS)
         .args([
             "--print-query",
-            "--expect=ctrl-n,alt-enter,ctrl-p,ctrl-d",
+            "--expect=ctrl-n,alt-enter,ctrl-p,ctrl-d,ctrl-u,alt-u",
             row::DELIMITER,
             row::WITH_NTH,
             row::ACCEPT_NTH,
@@ -770,45 +811,18 @@ fn pick_base(repo: &str, base: &str) -> Option<String> {
         tty::err("no branches to pick from");
         return None;
     }
-    let list = branches.join("\n");
-    let query = util::strip_remote(base);
-
-    let mut child = std::process::Command::new("fzf")
-        .args([
-            "--ansi",
-            "--reverse",
-            "--info=inline",
-            "--border=rounded",
-            "--prompt=base branch ❯ ",
-            "--header=pick a base branch · esc to cancel",
-            "--query",
-            &query,
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .ok()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(list.as_bytes());
-    }
-    let out = child.wait_with_output().ok()?;
-    let choice = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if choice.is_empty() {
-        None
-    } else {
-        Some(choice)
-    }
+    tty::pick(
+        &branches.join("\n"),
+        "base branch",
+        "pick a base branch · esc to cancel",
+        &util::strip_remote(base),
+    )
 }
 
 /// Open the checkout in Herdr and return its root pane id (so the setup pane
 /// can be split next to it).
 fn open_worktree(path: &str, branch: &str, config: &Config, repo: &str) -> Option<String> {
-    if config.open_mode() == "tab" {
-        herdr::open_tab_pane(herdr::current_workspace().as_deref(), path, branch)
-    } else {
-        herdr::open_worktree_pane(herdr::root_workspace(repo).as_deref(), repo, path, branch)
-    }
+    herdr::open_checkout(config.open_mode(), repo, path, branch)
 }
 
 fn switch_worktree(context: &PickerContext, path: &str, branch: &str) -> Result<()> {
@@ -1151,12 +1165,7 @@ fn refresh_base(config: &Config, repo: &str, base: &str) {
     if !config.fetch_before_create() || git::remote_base_parts(repo, base).is_none() {
         return;
     }
-    let progress = ProgressBar::new_spinner();
-    if let Ok(style) = ProgressStyle::with_template("{spinner:.cyan} {msg}") {
-        progress.set_style(style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]));
-    }
-    progress.set_message(format!("Fetching {base}…"));
-    progress.enable_steady_tick(Duration::from_millis(80));
+    let progress = tty::spinner(format!("Fetching {base}…"));
     let outcome = git::fetch_base(repo, base);
     progress.finish_and_clear();
     if outcome == git::FetchBase::Failed {

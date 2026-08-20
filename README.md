@@ -14,7 +14,7 @@ unresolved review threads, conflict, age, working tree, and push/pull state.
 │   main              herdr-worktrees —         —         —                  4h     clean     ↓1      │
 │   kees/queue-retry  —               #1235     —         —                  1d     —         merged  │
 │   kees/old-spike    —               —         —         —                  3w     —         local   │
-│ enter switch/create · ctrl-n new · alt+enter base… · ctrl-p open PR · GitHub: now                   │
+│ enter switch/create · ctrl-n new · alt+enter base… · ctrl-u update · ctrl-p open PR · GitHub: now   │
 └─────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -78,6 +78,8 @@ Press `prefix+w` in a Git workspace to open the picker.
 | `prefix+shift+w` | Open the picker in custom-base mode. |
 | `prefix+d` | Open the removal picker. |
 | `tab` / `shift-tab` | Select or deselect worktrees in the removal picker. |
+| `ctrl-u` | Bring the base branch into the highlighted worktree, starting an agent if it conflicts. |
+| `alt+u` | Choose a base branch, then update the highlighted worktree with it. |
 | `ctrl-p` | Open the highlighted branch's pull request. |
 | `ctrl-d` | Remove the highlighted worktree from the main picker. |
 | `ctrl-r` | Recompute local and remote-tracking metadata, bypassing the GitHub cache. |
@@ -261,6 +263,48 @@ This works independently of `github-prs` (which only controls the background PR
 columns). Set `pr-checkout = false` to disable the feature entirely, so a bare
 number is treated as a literal branch name again.
 
+## Updating a worktree
+
+Press `ctrl-u` on a worktree row to bring the base branch into it. The base is
+fetched first, then merged (or rebased, see `[update].strategy`) with
+`--autostash`, so uncommitted work does not block the update and is restored
+afterwards. Press `alt+u` instead to pick the base branch for this update.
+
+Nothing needs a human when the update is clean: the picker reports `merged
+origin/main into kees/parser-fix` and redraws with the new sync state. A
+worktree that already has the base says so and does nothing.
+
+When git stops on conflicts, the plugin starts a coding agent in that worktree
+through `herdr agent start` and hands it a one-line task describing the merge,
+the conflicted files, and how to finish. With the default `agent = "ask"` a
+small fzf prompt asks which agent to use first; `esc` skips it and leaves the
+conflict for you. A worktree that is *already* stopped mid-merge or mid-rebase
+takes the same path, so `ctrl-u` also works as "hand this conflict to an agent".
+
+```toml
+[update]
+strategy = "merge"            # "merge" or "rebase"
+agent = "ask"                 # a Herdr agent kind, or "ask" to choose each time
+agents = ["claude", "codex", "opencode", "pi"]   # what "ask" offers
+prompt = ""                   # override the task the agent is started with
+
+[update.agent-args]
+claude = ["--permission-mode", "acceptEdits"]    # extra argv per agent kind
+```
+
+`prompt` is rendered with `{{ branch }}`, `{{ base }}`, `{{ strategy }}`,
+`{{ past }}` (`merged`/`rebased`), `{{ continue }}` (`merge --continue` or
+`rebase --continue`), and `{{ files }}`. Keep it to one line — Herdr submits the
+prompt it sends, so a newline would submit the first line on its own.
+
+Like every other setting, `[update]` can be set per repository:
+
+```toml
+[projects."github.com/acme/monolith".update]
+strategy = "rebase"
+agent = "codex"
+```
+
 ## Removing worktrees
 
 Press `prefix+d` to list every worktree except the main checkout. Rows appear
@@ -281,8 +325,8 @@ Removal runs in the background and reports progress in a temporary Herdr pane.
 The estimated freed space is based on filesystem block counts and can be
 affected by unrelated disk activity.
 
-Warned rows require `ctrl-x` unless `[remove].force = true`. Local branches are
-kept unless `delete-branch = true`.
+Warned rows show what makes them unsafe unless `[remove].force = true`; enter
+confirms either way. Local branches are kept unless `delete-branch = true`.
 
 ## Configuration
 
@@ -310,7 +354,11 @@ height = "70%"
 
 [remove]
 delete-branch = false
-force = false                 # bypass dirty and unpublished guards
+force = false                 # skip the dirty and unpublished warning
+
+[update]
+strategy = "merge"            # "merge" or "rebase" the base into a worktree
+agent = "ask"                 # a Herdr agent kind, or "ask" to choose each time
 
 [pre-start]
 setup-worktree = '''
@@ -441,7 +489,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the release checklist.
 Herdr plugins are not sandboxed. This plugin runs `git`, `fzf`, `gh`, `herdr`,
 and your configured setup script with your user permissions. Review the source
 and your `[pre-start].setup-worktree` command before installing. The dirty and
-unpublished checks reduce accidental deletion; `force = true` bypasses them.
+unpublished warnings reduce accidental deletion; `force = true` hides them.
 
 Report security issues privately through the repository's GitHub security
 advisory page rather than a public issue.

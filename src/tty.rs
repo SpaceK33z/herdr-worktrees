@@ -1,6 +1,9 @@
-//! Terminal helpers: errors, single-keypress confirmation, and pause-on-close.
+//! Terminal helpers: errors, single-keypress confirmation, pause-on-close,
+//! progress spinners, and the small fzf prompts the popup opens over itself.
 
+use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{IsTerminal, Write};
+use std::time::Duration;
 
 pub fn err(msg: &str) {
     eprintln!("\x1b[31m{msg}\x1b[0m");
@@ -53,11 +56,50 @@ pub fn wait_key() {
     }
 }
 
-/// Ask for confirmation. `ctrl-x` always confirms; otherwise a guarded prompt
-/// requires `ctrl-x` and a normal prompt accepts enter / y / Y. Without a
-/// terminal nobody can answer, so the answer is no — these prompts guard
-/// worktree removal and running setup scripts from forks.
-pub fn confirm(prompt: &str, require_force: bool) -> bool {
+/// A ticking spinner for work the user is waiting on. The caller keeps it alive
+/// for the duration and calls `finish_and_clear` so the line leaves no trace.
+pub fn spinner(message: impl Into<String>) -> ProgressBar {
+    let progress = ProgressBar::new_spinner();
+    if let Ok(style) = ProgressStyle::with_template("{spinner:.cyan} {msg}") {
+        progress.set_style(style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]));
+    }
+    progress.set_message(message.into());
+    progress.enable_steady_tick(Duration::from_millis(80));
+    progress
+}
+
+/// Open a small fzf prompt over `items` (one candidate per line) and return the
+/// chosen line. `None` covers both cancelling and fzf failing to run at all,
+/// which callers treat the same way: the action does not happen.
+pub fn pick(items: &str, prompt: &str, header: &str, query: &str) -> Option<String> {
+    let mut child = std::process::Command::new("fzf")
+        .args([
+            "--ansi",
+            "--reverse",
+            "--info=inline",
+            "--border=rounded",
+            &format!("--prompt={prompt} ❯ "),
+            &format!("--header={header}"),
+            "--query",
+            query,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(items.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    let choice = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!choice.is_empty()).then_some(choice)
+}
+
+/// Ask for confirmation: enter / y / Y confirms, any other key cancels.
+/// Without a terminal nobody can answer, so the answer is no — these prompts
+/// guard worktree removal and running setup scripts from forks.
+pub fn confirm(prompt: &str) -> bool {
     if !std::io::stdin().is_terminal() {
         err("stdin is not a terminal; run interactively to confirm");
         return false;
@@ -65,12 +107,6 @@ pub fn confirm(prompt: &str, require_force: bool) -> bool {
     println!("\n{prompt}");
     let key = read_key();
     println!();
-    if key == Some(0x18) {
-        return true;
-    }
-    if require_force {
-        return false;
-    }
     // A read error yields `None`, which is a denial like any other non-answer.
     matches!(key, Some(b'\n' | b'\r' | b'y' | b'Y'))
 }
