@@ -4,6 +4,7 @@
 
 pub mod background;
 pub mod config;
+pub mod create;
 pub mod detect;
 pub mod git;
 pub mod herdr;
@@ -25,7 +26,8 @@ pub mod util;
 use anyhow::Result;
 
 const USAGE: &str = concat!(
-    "usage: herdr-worktrees [open|picker|remover|remove|setup|detect|include] [args...]\n",
+    "usage: herdr-worktrees [open|picker|create|remover|remove|setup|detect|include] [args...]\n",
+    "       herdr-worktrees create <branch> [--base <ref>] [--exact] [--json] [--no-setup]\n",
     "       herdr-worktrees [--json|--fzf|--header] [--no-cache|--no-detached|--fast]"
 );
 
@@ -44,6 +46,7 @@ const ENGINE_FLAGS: [&str; 6] = [
 pub fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("open") => open::run(&args[1..]),
+        Some("create") => create::run_cli(&args[1..]),
         Some("picker") => picker::run(&args[1..]),
         Some("picker-cache-list") => picker::run_cached_list(&args[1..]),
         Some("picker-cache-refresh") => picker::run_cache_refresh(&args[1..]),

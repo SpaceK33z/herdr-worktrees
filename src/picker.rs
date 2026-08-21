@@ -2,6 +2,7 @@
 
 use crate::background;
 use crate::config::{apply_branch_prefix, branch_short_name, Config};
+use crate::create;
 use crate::git;
 use crate::herdr;
 use crate::model::{self, Engine};
@@ -1072,26 +1073,12 @@ fn checkout_fork_pr(
     result.map(|()| true)
 }
 
-/// `git worktree add` for an explicit user action: git's own diagnostics reach
-/// the pane (an existing path, a branch checked out elsewhere, a bad name), so
-/// the error only has to say which step they belong to.
-fn worktree_add(args: &[&str]) -> Result<()> {
-    if !git::git_inherit(args) {
-        bail!("git worktree add failed — see the error above");
-    }
-    Ok(())
-}
+use create::worktree_add;
 
 fn add_remote_tracking_worktree(repo: &str, path: &str, local: &str, remote: &str) -> Result<()> {
     worktree_add(&[
         "-C", repo, "worktree", "add", "-b", local, "--track", path, remote,
     ])
-}
-
-/// Reject a name `git` would refuse before `git worktree add` fails on it, so
-/// the create row can say what is actually wrong.
-fn valid_branch_name(repo: &str, name: &str) -> bool {
-    git::git_success(&["-C", repo, "check-ref-format", "--branch", name])
 }
 
 fn create_worktree(
@@ -1121,58 +1108,10 @@ fn create_worktree(
         return Ok(());
     }
 
-    if !valid_branch_name(repo, &final_branch) {
-        bail!("'{final_branch}' is not a valid branch name");
-    }
-
-    // Every `worktree add` runs with `-C repo`, so a relative `worktree-path`
-    // template resolves against the repo root rather than the popup's cwd.
-    if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
-        // branch exists but has no checkout yet -> check it out into a new worktree
-        worktree_add(&[
-            "-C",
-            repo,
-            "worktree",
-            "add",
-            path.as_str(),
-            final_branch.as_str(),
-        ])?;
-    } else {
-        // Only a brand-new branch starts from `base`, so only that path needs
-        // the base to be current.
-        refresh_base(config, repo, base);
-        worktree_add(&[
-            "-C",
-            repo,
-            "worktree",
-            "add",
-            path.as_str(),
-            "-b",
-            final_branch.as_str(),
-            base,
-        ])?;
-    }
+    create::create(config, repo, name, Some(base), exact_branch)?;
 
     open_and_setup_worktree(&path, &final_branch, base, repo, config);
     Ok(())
-}
-
-/// Refresh the base's remote-tracking ref so the new branch starts from the
-/// current upstream tip. Purely advisory: an unreachable remote, a rejected
-/// fetch, or one that outruns [`git::FETCH_TIMEOUT`] leaves the local copy in
-/// place and creation continues from it.
-fn refresh_base(config: &Config, repo: &str, base: &str) {
-    if !config.fetch_before_create() || git::remote_base_parts(repo, base).is_none() {
-        return;
-    }
-    let progress = tty::spinner(format!("Fetching {base}…"));
-    let outcome = git::fetch_base(repo, base);
-    progress.finish_and_clear();
-    if outcome == git::FetchBase::Failed {
-        tty::warn(&format!(
-            "could not fetch {base} — creating from the local copy"
-        ));
-    }
 }
 
 /// Open the checkout right away, then run setup in the existing split-pane or
@@ -1271,7 +1210,7 @@ mod tests {
         add_remote_tracking_worktree, append_create_row, atomic_replace_cache, build_fzf_bind,
         entry_route, parse_pr_query, picker_footer, pr_head_name, prepend_pr_row,
         refresh_helper_args, render_query_aware_list, restore_ranked_rows,
-        selected_creation_target, valid_branch_name, EntryRoute, PickerCache, PickerCommands,
+        selected_creation_target, EntryRoute, PickerCache, PickerCommands,
         INTERNAL_FZF_FILTER_ARGS, MAIN_FZF_SEARCH_ARGS, PICKER_FOOTER,
     };
     use std::io::Write as _;
@@ -1582,13 +1521,13 @@ mod tests {
         let repo = repo.to_string_lossy().into_owned();
         assert!(crate::git::git_success(&["-C", &repo, "init", "--quiet"]));
 
-        assert!(valid_branch_name(&repo, "feature/x"));
-        assert!(valid_branch_name(&repo, "kees/fix-1"));
-        assert!(!valid_branch_name(&repo, "feature x"));
-        assert!(!valid_branch_name(&repo, "feature..x"));
-        assert!(!valid_branch_name(&repo, "-leading-dash"));
-        assert!(!valid_branch_name(&repo, "trailing.lock"));
-        assert!(!valid_branch_name(&repo, ""));
+        assert!(crate::create::valid_branch_name(&repo, "feature/x"));
+        assert!(crate::create::valid_branch_name(&repo, "kees/fix-1"));
+        assert!(!crate::create::valid_branch_name(&repo, "feature x"));
+        assert!(!crate::create::valid_branch_name(&repo, "feature..x"));
+        assert!(!crate::create::valid_branch_name(&repo, "-leading-dash"));
+        assert!(!crate::create::valid_branch_name(&repo, "trailing.lock"));
+        assert!(!crate::create::valid_branch_name(&repo, ""));
 
         let _ = std::fs::remove_dir_all(&repo);
     }
