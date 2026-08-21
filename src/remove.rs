@@ -740,6 +740,21 @@ fn branch_deletion_safety(config: &Config, repo: &str, branch: &str) -> Result<D
         .unwrap_or(DeletionSafety::Unpublished))
 }
 
+/// How many commits the patch-id squash-merge fallback is willing to walk on
+/// the target side.
+///
+/// [`is_squash_merged_via_patch_id`] runs `git rev-list <merge-base>..<target>
+/// | git diff-tree --stdin -p | git patch-id` — one patch per commit the base
+/// gained since the branch diverged. On a fast-moving repo an old branch can
+/// sit thousands of commits behind the tip, turning one integration check
+/// into seconds of work. A cheap `git rev-list --count` pre-flight enforces
+/// this cap. 500 is conservative: per-commit cost scales with changed files ×
+/// changed lines, so a few hundred lockfile-bump squashes are slower than a
+/// few thousand tiny commits, yet a normal review-and-cleanup cycle sits well
+/// inside the limit. A branch squash-merged further back than the cap is
+/// reported as *not* integrated — the safe direction.
+const PATCH_ID_SCAN_MAX_COMMITS: usize = 500;
+
 /// Why a branch's content is already in the base branch, even though git
 /// ancestry and upstream tracking cannot show it. Probes mirror worktrunk's
 /// branch-cleanup ladder, cheapest first; any single hit means deleting the
@@ -770,7 +785,8 @@ fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Optio
     }
 
     // 3. No added changes — the diff from the merge-base is empty.
-    if let Some(base) = merge_base(repo, &target_oid, &branch_oid) {
+    let base = merge_base(repo, &target_oid, &branch_oid);
+    if let Some(base) = &base {
         let range = format!("{base}..{branch_oid}");
         let files = git::git_stdout(&["-C", repo, "diff", "--name-only", &range]);
         if files.trim().is_empty() {
@@ -788,10 +804,12 @@ fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Optio
     // 5. Merge adds nothing — simulating the merge reproduces the base tree,
     //    which covers squash merges where the base advanced with changes to
     //    other files. Needs git >= 2.38 (`merge-tree --write-tree`); older
-    //    git skips the probe. A conflicted simulation falls through: without
-    //    the patch-id fallback this is the conservative answer.
-    if let (Some(target_tree), Ok(output)) = (
-        target_tree,
+    //    git skips the probe. Exit code 1 means the simulated merge
+    //    conflicts — usually because the base later touched the same files
+    //    the (already squashed) branch changed — and hands over to the
+    //    patch-id fallback; every other failure skips it.
+    let conflicted = match (
+        target_tree.as_deref(),
         git::git_output(&[
             "-C",
             repo,
@@ -801,14 +819,93 @@ fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Optio
             &branch_oid,
         ]),
     ) {
-        if output.status.success() {
+        (Some(target_tree), Ok(output)) if output.status.success() => {
             let merged = String::from_utf8_lossy(&output.stdout);
-            if merged.lines().next().map(str::trim) == Some(target_tree.as_str()) {
+            if merged.lines().next().map(str::trim) == Some(target_tree) {
                 return Some(format!("merging {branch} into {target} adds nothing"));
+            }
+            false
+        }
+        (_, Ok(output)) if output.status.code() == Some(1) => true,
+        _ => false,
+    };
+
+    // 6. Patch-id match — when merging conflicts, look for a commit on the
+    //    base whose entire diff hashes identically to the branch's combined
+    //    diff. That commit IS the squash merge, however much the two
+    //    histories have since diverged around it.
+    if conflicted {
+        if let Some(base) = base.as_deref() {
+            if let Some(reason) =
+                is_squash_merged_via_patch_id(repo, &target, branch, &branch_oid, &target_oid, base)
+            {
+                return Some(reason);
             }
         }
     }
 
+    None
+}
+
+/// Detect a squash merge by patch-id matching.
+///
+/// Hashes the branch's entire diff against the merge-base and checks whether
+/// any single commit on the target hashes to the same value — a match means
+/// the target contains exactly the branch's changes as one commit, whatever
+/// else landed around it.
+///
+/// Both sides generate their diffs with `git diff-tree` (plumbing), never
+/// `git log -p`: porcelain honors the user's `diff.context` / `diff.algorithm`
+/// config while plumbing ignores it, so a mismatched pair could hash the same
+/// change differently and never agree.
+fn is_squash_merged_via_patch_id(
+    repo: &str,
+    target: &str,
+    branch: &str,
+    branch_oid: &str,
+    target_oid: &str,
+    merge_base: &str,
+) -> Option<String> {
+    // Bound the target-side walk before any diffing starts. See
+    // [`PATCH_ID_SCAN_MAX_COMMITS`] for why this must be cheap.
+    let count: usize = git::git_stdout(&[
+        "-C",
+        repo,
+        "rev-list",
+        "--count",
+        &format!("{merge_base}..{target_oid}"),
+    ])
+    .trim()
+    .parse()
+    .ok()?;
+    if count > PATCH_ID_SCAN_MAX_COMMITS {
+        return None;
+    }
+
+    // The branch side diffs the merge-base tree against the branch tip — one
+    // patch for the whole branch.
+    let branch_pids = patch_ids_from(repo, &["diff-tree", "-p", merge_base, branch_oid], None)?;
+    let branch_pid = branch_pids.split_whitespace().next()?;
+
+    // The target side gets its commit list from rev-list (small, so buffered)
+    // and streams one diff per commit into patch-id in a single pass.
+    let commits = git::git_stdout(&[
+        "-C",
+        repo,
+        "rev-list",
+        &format!("{merge_base}..{target_oid}"),
+    ]);
+    let target_pids = patch_ids_from(
+        repo,
+        &["diff-tree", "--stdin", "-p"],
+        Some(commits.into_bytes()),
+    )?;
+    if target_pids
+        .lines()
+        .any(|line| line.split_whitespace().next() == Some(branch_pid))
+    {
+        return Some(format!("{target} has a squash merge of {branch}"));
+    }
     None
 }
 
@@ -833,6 +930,80 @@ fn commit_tree(repo: &str, oid: &str) -> Option<String> {
     let out = git::git_stdout(&["-C", repo, "rev-parse", &spec]);
     let tree = out.trim();
     (!tree.is_empty()).then(|| tree.to_string())
+}
+
+/// Hash `git <args>`'s diff output through `git patch-id --verbatim`, returning
+/// one `<hash> <hash>` line per input patch.
+///
+/// The diff stream is captured before hashing because `ChildStdout` has no
+/// stable `try_clone`, so two children cannot be connected directly here. This
+/// is bounded by [`PATCH_ID_SCAN_MAX_COMMITS`] (and patch-id's own output is
+/// one short line per patch — well inside a pipe buffer), so neither side can
+/// deadlock on a full pipe. Any failure yields `None`: callers treat "no patch
+/// ids" as "not integrated".
+fn patch_ids_from(repo: &str, args: &[&str], stdin: Option<Vec<u8>>) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::process::{Command, Stdio};
+
+    let mut argv: Vec<&str> = vec!["-C", repo];
+    argv.extend_from_slice(args);
+    // Capture the source's diff stream. With `stdin` data (a rev-list commit
+    // list feeding `diff-tree --stdin`) the list is written first: it is
+    // small, so write-then-read cannot deadlock.
+    let diffs = match stdin {
+        None => {
+            let output = git::git_output(&argv).ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            output.stdout
+        }
+        Some(data) => {
+            let mut child = Command::new("git")
+                .env("LC_ALL", "C")
+                .args(&argv)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()?;
+            if child
+                .stdin
+                .take()
+                .is_none_or(|mut pipe| pipe.write_all(&data).is_err())
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            let output = child.wait_with_output().ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            output.stdout
+        }
+    };
+
+    let mut piper = Command::new("git")
+        .env("LC_ALL", "C")
+        .args(["patch-id", "--verbatim"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if piper
+        .stdin
+        .take()
+        .is_none_or(|mut pipe| pipe.write_all(&diffs).is_err())
+    {
+        let _ = piper.kill();
+        let _ = piper.wait();
+        return None;
+    }
+    let mut ids = String::new();
+    piper.stdout.as_mut()?.read_to_string(&mut ids).ok()?;
+    piper.wait().ok()?.success().then_some(ids)
 }
 
 fn risk_is_covered(authorized: Option<RemovalRisk>, current: Option<RemovalRisk>) -> bool {
@@ -1921,6 +2092,50 @@ mod tests {
         let reason = branch_integration_reason(&config, repo.to_str().unwrap(), "feature")
             .expect("identical trees must count as integrated");
         assert!(reason.contains("content matches"), "{reason}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn squash_merge_conflicting_with_later_base_edits_is_detected_by_patch_id() {
+        let (root, repo) = repo_with_main("safety-patch-id");
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("seed"), "branch work").unwrap();
+        git(&repo, &["commit", "-qam", "feature work"]);
+        // Squash the branch onto main, then have main touch the SAME file.
+        // The simulated merge now conflicts, so only the patch-id fallback
+        // can prove integration; without it this branch reads as unmerged.
+        git(&repo, &["checkout", "-q", "main"]);
+        git(&repo, &["merge", "--squash", "-q", "feature"]);
+        git(&repo, &["commit", "-qm", "squash feature"]);
+        std::fs::write(repo.join("seed"), "later edit\n").unwrap();
+        git(&repo, &["commit", "-qam", "main edits the same file"]);
+
+        let config = delete_branch_config();
+        let reason = branch_integration_reason(&config, repo.to_str().unwrap(), "feature")
+            .expect("a conflicted squash merge must still count as integrated");
+        assert!(reason.contains("squash merge"), "{reason}");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn patch_id_match_requires_the_whole_branch_diff_on_the_target() {
+        let (root, repo) = repo_with_main("safety-patch-id-miss");
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("seed"), "branch work").unwrap();
+        std::fs::write(repo.join("extra"), "more").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "feature work"]);
+        // Main independently changes the same file but never receives the
+        // branch's full diff — a partial overlap must not read as integrated.
+        git(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("seed"), "different work").unwrap();
+        git(&repo, &["commit", "-qam", "unrelated change to seed"]);
+
+        let config = delete_branch_config();
+        assert_eq!(
+            branch_integration_reason(&config, repo.to_str().unwrap(), "feature"),
+            None
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

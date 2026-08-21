@@ -17,6 +17,13 @@ Notable user-visible changes are recorded here. This project follows
 - A branch still checked out in another worktree is never deleted, regardless
   of merge status or confirmation: deleting the ref would leave that worktree
   unable to resolve `HEAD`. The removal summary names the surviving checkout.
+- Squash merges that later conflict are still recognized. When a branch was
+  squash-merged and the base branch afterwards changed the same files, the
+  simulated merge conflicts — previously that read as unmerged work. The
+  branch's combined diff is now hashed (`git patch-id`) against every commit
+  on the base since the merge point; an exact match proves the squash landed,
+  so the branch is deleted without a confirmation prompt. The walk is capped
+  at 500 base commits; beyond that the conservative "unmerged" answer stands.
 
 - `herdr-worktrees create <branch>`: the popup's creation pipeline as a plain
   CLI command, for coding agents and scripts. Applies `branch-prefix`, the
