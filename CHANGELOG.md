@@ -7,6 +7,17 @@ Notable user-visible changes are recorded here. This project follows
 
 ### Added
 
+- Safer automatic branch deletion. When `remove.delete-branch` is on, a branch
+  whose upstream is gone or stale — the normal state after a GitHub squash
+  merge — is now still deleted without a confirmation prompt when its content
+  has already landed on the base branch. Content integration is detected by
+  cheap plumbing probes, in order of cost: same commit as the base, contained
+  in the base's history, no file changes vs. the base, identical trees, or a
+  simulated merge (`git merge-tree`) that would add nothing.
+- A branch still checked out in another worktree is never deleted, regardless
+  of merge status or confirmation: deleting the ref would leave that worktree
+  unable to resolve `HEAD`. The removal summary names the surviving checkout.
+
 - `herdr-worktrees create <branch>`: the popup's creation pipeline as a plain
   CLI command, for coding agents and scripts. Applies `branch-prefix`, the
   `worktree-path` template, base resolution, and fetch-before-create, then
