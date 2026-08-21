@@ -131,8 +131,9 @@ remote discovery does not start one Git process per row. A `…` in **changes** 
   - `gone`: the configured upstream no longer exists
   - `merged`: GitHub reports a merged pull request at the branch's current commit
 
-Pull request columns and the `merged` state require `github-prs = true`, a
-GitHub remote, and an authenticated `gh` CLI. GitHub results are cached for 60
+Pull request columns and the `merged` state are enabled by default and require a
+GitHub remote and an authenticated `gh` CLI. Set `github-prs = false` to disable
+them. GitHub results are cached for 60
 seconds: opening the picker reuses a cached entry that is still fresh, while
 `ctrl-r` and `ctrl-f` always fetch. The dim footer timestamp shows when GitHub
 data was last fetched, and reads `GitHub: failed` when the last fetch could not
@@ -348,7 +349,7 @@ worktree-path = "{{ repo_path }}/.worktrees/{{ branch | sanitize }}"
 base-branch = "main"          # fallback: remote HEAD, main/master, current branch
 branch-prefix = ""            # for example, "kees/"
 open-mode = "workspace"       # "workspace" or "tab"
-github-prs = false            # PR, review threads, conflict, and merged state
+github-prs = true             # PR, review threads, conflict, and merged state
 auto-detect = true            # infer unset settings from the repo (see below)
 pr-checkout = true            # checkout a PR by typing its number
 worktree-include = true       # copy .worktreeinclude entries into new worktrees

@@ -16,6 +16,11 @@ Notable user-visible changes are recorded here. This project follows
   before creating a branch from it, so new work starts from the upstream tip. A
   failed or slow fetch falls back to the local copy instead of blocking.
 
+### Changed
+
+- GitHub pull request columns and merged state are now enabled by default. Set
+  `github-prs = false` to opt out.
+
 ### Fixed
 
 - Pull request columns and the `merged` state stayed empty in repositories with

@@ -209,7 +209,7 @@ impl Config {
     }
 
     pub fn github_prs(&self) -> bool {
-        self.github_prs.unwrap_or(false)
+        self.github_prs.unwrap_or(true)
     }
 
     pub fn show_worktree_name(&self) -> bool {
@@ -420,6 +420,12 @@ worktree-path = "/nope/{{ branch }}"
         // The most specific matching key wins, and leaves the rest alone.
         assert_eq!(config.worktree_path.as_deref(), Some("/wt/{{ branch }}"));
         assert_eq!(config.base_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn github_prs_defaults_on_and_can_be_disabled() {
+        assert!(parse("").github_prs());
+        assert!(!parse("github-prs = false").github_prs());
     }
 
     #[test]
