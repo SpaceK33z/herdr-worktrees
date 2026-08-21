@@ -230,8 +230,12 @@ impl Config {
         self.worktree_include.unwrap_or(true)
     }
 
+    /// Delete the branch when its worktree is removed. Defaults to true: a
+    /// branch is only auto-deleted when its content is provably on the base
+    /// branch (pushed, or landed via squash merge/rebase), and a branch still
+    /// checked out in another worktree is never deleted.
     pub fn delete_branch(&self) -> bool {
-        self.remove.delete_branch.unwrap_or(false)
+        self.remove.delete_branch.unwrap_or(true)
     }
 
     pub fn force(&self) -> bool {
