@@ -7,6 +7,11 @@ Notable user-visible changes are recorded here. This project follows
 
 ### Added
 
+- `herdr-worktrees create <branch>`: the popup's creation pipeline as a plain
+  CLI command, for coding agents and scripts. Applies `branch-prefix`, the
+  `worktree-path` template, base resolution, and fetch-before-create, then
+  copies `.worktreeinclude` entries and runs the setup script synchronously.
+  Supports `--base`, `--exact`, `--json`, and `--no-setup`.
 - `.worktreeinclude` support: gitignored files named by that file — `.env`, a
   local secrets file, a dependency directory — are copied into a new worktree
   before the setup script runs, reflinked where the filesystem allows it.
@@ -23,6 +28,9 @@ Notable user-visible changes are recorded here. This project follows
 
 ### Fixed
 
+- `{{ user }}` expanded to the raw git `user.name`, so a full name like
+  "Kees Kluskens" produced an invalid branch prefix and creation failed. The
+  name is now sanitized to one safe token (`Kees-Kluskens`).
 - Pull request columns and the `merged` state stayed empty in repositories with
   a long pull request history. The background refresh paged through every pull
   request the repository ever had, which no timeout can wait out; it now lists

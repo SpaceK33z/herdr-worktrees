@@ -168,7 +168,9 @@ pub fn resolve_user(repo: &str) -> String {
     let u = git_stdout(&["-C", repo, "config", "--get", "user.name"]);
     let u = u.trim();
     if !u.is_empty() {
-        return u.to_string();
+        // A full name like "Kees Kluskens" must still work as a branch prefix
+        // and a path fragment, so collapse it to one safe token first.
+        return crate::util::sanitize(u);
     }
     if let Ok(u) = std::env::var("USER") {
         if !u.is_empty() {
@@ -295,7 +297,10 @@ pub fn has_github_remote(repo: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{base_ref_policy, fetch_base, git_timeout, ref_oid, remote_base_parts, FetchBase};
+    use super::{
+        base_ref_policy, fetch_base, git_timeout, ref_oid, remote_base_parts, resolve_user,
+        FetchBase,
+    };
     use crate::config::Config;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -451,6 +456,23 @@ mod tests {
 
         assert_eq!(fetch_base(&repo, "origin/main"), FetchBase::Failed);
         assert_eq!(ref_oid(&repo, "refs/remotes/origin/main"), Some(stale));
+    }
+
+    #[test]
+    fn a_multi_word_user_name_becomes_one_safe_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-wt-user-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "--quiet"]);
+        git(&dir, &["config", "user.name", "Kees Kluskens"]);
+        let repo = dir.to_string_lossy();
+        // The name must survive as a branch prefix: no spaces, no slashes.
+        assert_eq!(resolve_user(&repo), "Kees-Kluskens");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
