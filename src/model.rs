@@ -271,7 +271,13 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
 
     let cached_prs = options.cached_prs && github_prs;
     let pr_heads = if fetch_prs || cached_prs {
-        pr_heads(&records, &branch_records, &remote_records, &refs, &base_short)
+        pr_heads(
+            &records,
+            &branch_records,
+            &remote_records,
+            &refs,
+            &base_short,
+        )
     } else {
         Vec::new()
     };
@@ -359,8 +365,8 @@ fn compute(repo: &str, config: &Config, state_dir: &Path, options: ComputeOption
             .partial_cmp(&a.created_ts)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    branches.sort_by(|a, b| b.when_ts.cmp(&a.when_ts));
-    remote_branches.sort_by(|a, b| b.when_ts.cmp(&a.when_ts));
+    branches.sort_by_key(|branch| std::cmp::Reverse(branch.when_ts));
+    remote_branches.sort_by_key(|branch| std::cmp::Reverse(branch.when_ts));
 
     Engine {
         repo_path: repo.to_string(),
@@ -855,7 +861,10 @@ mod tests {
         );
 
         let removable = pr_heads(&worktrees, &[], &[], &refs, "main");
-        assert_eq!(removable, vec![("kees/fix".to_string(), "fresh".to_string())]);
+        assert_eq!(
+            removable,
+            vec![("kees/fix".to_string(), "fresh".to_string())]
+        );
     }
 
     /// Both pickers answer the same questions about a branch — is there a PR,

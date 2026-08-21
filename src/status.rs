@@ -123,10 +123,9 @@ pub fn sync_from_tracking(track: &str) -> Option<SyncStatus> {
     for part in track.split(',').map(str::trim) {
         if let Some(value) = part.strip_prefix("ahead ") {
             ahead = value.parse().ok()?;
-        } else if let Some(value) = part.strip_prefix("behind ") {
-            behind = value.parse().ok()?;
         } else {
-            return None;
+            let value = part.strip_prefix("behind ")?;
+            behind = value.parse().ok()?;
         }
     }
     Some(from_counts(behind, ahead))

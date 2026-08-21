@@ -392,7 +392,7 @@ impl Source for Observed {
                 None => votes.push((template, 1)),
             }
         }
-        votes.sort_by(|a, b| b.1.cmp(&a.1));
+        votes.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
         let (template, count) = votes.first()?;
         // A tie means the repo has no single layout; leave it to the default.
         if votes.get(1).map(|(_, c)| c >= count).unwrap_or(false) {
