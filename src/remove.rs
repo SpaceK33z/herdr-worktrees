@@ -79,6 +79,11 @@ enum DeletionSafety {
 struct RemovalInspection {
     prepared: PreparedRemoval,
     changes: ChangeCounts,
+    /// Dimmed tag shown after the safety cell explaining why the branch is
+    /// deletable (`pushed`, `merged`). Display-only: the detached worker
+    /// recomputes the real verdict, so this never crosses the remove-bg-batch
+    /// argv protocol.
+    safety_note: Option<String>,
 }
 
 /// The removal picker's changes column. Unlike the switch picker it has room to
@@ -277,7 +282,7 @@ fn render_remove_candidates(
         .iter()
         .filter(|worktree| worktree.path != repo)
         .collect();
-    let inspections = inspect.then(|| inspect_candidates(&removable, config));
+    let inspections = inspect.then(|| inspect_candidates(&removable, config, repo));
     let mut rows = Vec::with_capacity(removable.len());
 
     for (index, worktree) in removable.into_iter().enumerate() {
@@ -289,7 +294,10 @@ fn render_remove_candidates(
                 display.unstaged = inspection.changes.unstaged;
                 display.dirty = inspection.changes.dirty();
                 display.changes = changes_display(inspection.changes);
-                render_safety(inspection.prepared.authorized_risk)
+                append_safety_tag(
+                    &render_safety(inspection.prepared.authorized_risk),
+                    inspection.safety_note.as_deref(),
+                )
             } else {
                 display.changes = "unknown".to_string();
                 render_unverified()
@@ -328,8 +336,11 @@ fn inspect_in_parallel<T: Sync, R: Send>(
 fn inspect_candidates(
     worktrees: &[&model::Worktree],
     config: &Config,
+    repo: &str,
 ) -> Vec<Result<RemovalInspection>> {
-    inspect_in_parallel(worktrees, |worktree| inspect_candidate(worktree, config))
+    inspect_in_parallel(worktrees, |worktree| {
+        inspect_candidate(worktree, config, repo)
+    })
 }
 
 fn inspect_targets(
@@ -355,11 +366,31 @@ fn inspect_targets(
     })
 }
 
-fn inspect_candidate(worktree: &model::Worktree, config: &Config) -> Result<RemovalInspection> {
+fn inspect_candidate(
+    worktree: &model::Worktree,
+    config: &Config,
+    repo: &str,
+) -> Result<RemovalInspection> {
     let changes = inspect_changes(&worktree.path)?;
     let detached = worktree.branch.is_empty();
-    let unpublished =
-        config.delete_branch() && !detached && sync_has_unpublished(worktree.sync_kind);
+    let deletable = config.delete_branch() && !detached;
+    let mut unpublished = deletable && sync_has_unpublished(worktree.sync_kind);
+    // Why the branch is deletable, for the dimmed safety tag. A sync state
+    // that already proves every commit reached the upstream needs no git
+    // calls; only ambiguous states justify running the probe ladder.
+    let safety_note = if !deletable {
+        None
+    } else if !unpublished {
+        Some("pushed".to_string())
+    } else {
+        let safety = branch_deletion_safety(config, repo, &worktree.branch)?;
+        // The probe outranks the sync heuristic: content proven to live on
+        // the base branch is deletable even when the sync column still says
+        // ahead/local/gone. Display-only either way — the removal re-inspects
+        // authoritatively before deleting anything.
+        unpublished = matches!(safety, DeletionSafety::Unpublished);
+        deletion_safety_tag(&safety).map(str::to_string)
+    };
     Ok(RemovalInspection {
         prepared: PreparedRemoval {
             branch: branch_name(worktree),
@@ -370,7 +401,28 @@ fn inspect_candidate(worktree: &model::Worktree, config: &Config) -> Result<Remo
             kept_by_checkout: None,
         },
         changes,
+        safety_note,
     })
+}
+
+/// Compact label for why a branch may be auto-deleted. `Unpublished` gets no
+/// tag: the ⚠ label already carries that warning.
+fn deletion_safety_tag(safety: &DeletionSafety) -> Option<&'static str> {
+    match safety {
+        DeletionSafety::Published(_) => Some("pushed"),
+        DeletionSafety::Integrated(_) => Some("merged"),
+        DeletionSafety::Unpublished => None,
+    }
+}
+
+/// Dimmed explanation appended after the padded safety cell. It lives inside
+/// the final fzf column, after the second tab, so the identity columns used
+/// by `parse_targets` stay untouched.
+fn append_safety_tag(safety: &str, note: Option<&str>) -> String {
+    match note {
+        Some(tag) => format!("{safety}\x1b[2m ·{tag}\x1b[0m"),
+        None => safety.to_string(),
+    }
 }
 
 /// The `remove --target <branch> <path>` one-off delete used by the picker's
@@ -1562,12 +1614,13 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_deletion_safety, branch_integration_reason, branch_publication, build_remove_bind,
-        changes_display, decode_batch_args, delete_branch_ref, encode_batch_args, follow_progress,
-        freed_suffix, inspect_target, parse_pid_header, parse_targets, perform_delete,
-        process_is_running, removal_risk, remove_fzf_args, render_remove_candidates,
-        risk_is_covered, sync_has_unpublished, validate_and_delete, ChangeCounts, DeletionSafety,
-        PreparedRemoval, ProgressOutcome, RemovalRisk, RemovalTarget, SyncKind,
+        append_safety_tag, branch_deletion_safety, branch_integration_reason, branch_publication,
+        build_remove_bind, changes_display, decode_batch_args, delete_branch_ref,
+        deletion_safety_tag, encode_batch_args, follow_progress, freed_suffix, inspect_target,
+        parse_pid_header, parse_targets, perform_delete, process_is_running, removal_risk,
+        remove_fzf_args, render_remove_candidates, risk_is_covered, sync_has_unpublished,
+        validate_and_delete, ChangeCounts, DeletionSafety, PreparedRemoval, ProgressOutcome,
+        PublicationProof, RemovalRisk, RemovalTarget, SyncKind,
     };
     use crate::config::Config;
     use indicatif::ProgressBar;
@@ -1951,6 +2004,89 @@ mod tests {
             validate_and_delete(&prepared, &Config::default(), repo.to_str().unwrap()).is_err()
         );
         assert!(worktree.is_dir());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn safety_tags_map_from_deletion_verdicts() {
+        assert_eq!(
+            deletion_safety_tag(&DeletionSafety::Published(PublicationProof {
+                reference: "refs/remotes/origin/main".to_string(),
+                oid: "abc".to_string(),
+            })),
+            Some("pushed")
+        );
+        assert_eq!(
+            deletion_safety_tag(&DeletionSafety::Integrated(
+                "feature content matches main".to_string()
+            )),
+            Some("merged")
+        );
+        // The ⚠ label already carries this warning; a tag would repeat it.
+        assert_eq!(deletion_safety_tag(&DeletionSafety::Unpublished), None);
+
+        let cell = render_cell();
+        assert_eq!(
+            append_safety_tag(&cell, Some("merged")),
+            format!("{cell}\x1b[2m ·merged\x1b[0m")
+        );
+        assert_eq!(append_safety_tag(&cell, None), cell);
+    }
+
+    fn render_cell() -> String {
+        "\x1b[32m✓ safe           \x1b[0m".to_string()
+    }
+
+    #[test]
+    fn enrichment_tags_why_a_branch_is_deletable_without_touching_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-remove-tag-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("repo");
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("seed"), "seed").unwrap();
+        git(&repo, &["add", "seed"]);
+        git(&repo, &["commit", "-qm", "seed"]);
+        // Same commit as main and no upstream: the integration probe proves it
+        // deletable via check 1.
+        git(&repo, &["branch", "feature"]);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "feature",
+            ],
+        );
+
+        let config = Config::default();
+        let state = root.join("state");
+        let repo_str = repo.to_str().unwrap();
+        let enriched = render_remove_candidates(repo_str, &config, &state, true);
+        assert!(enriched.contains("\x1b[2m ·merged\x1b[0m"), "{enriched}");
+
+        // The dimmed tag lives inside the final column: the identity columns
+        // fzf accepts back must be exactly branch and path.
+        for line in enriched.lines() {
+            let mut fields = line.split('\t');
+            assert_eq!(fields.next(), Some("feature"));
+            assert_eq!(
+                fields.next(),
+                Some(worktree.canonicalize().unwrap().to_string_lossy().as_ref())
+            );
+            assert_eq!(fields.count(), 1, "exactly one display column remains");
+        }
         std::fs::remove_dir_all(root).ok();
     }
 
