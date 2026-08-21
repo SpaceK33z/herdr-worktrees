@@ -7,6 +7,14 @@ Notable user-visible changes are recorded here. This project follows
 
 ### Added
 
+- The removal picker now explains its safety verdict. A dimmed tag after the
+  safety column says why a branch is deletable: `·pushed` (every commit is on
+  the upstream) or `·merged` (the content already landed on the base branch —
+  squash merge or rebase — even though git ancestry cannot show it). The tag
+  also refines the verdict itself: a branch the sync column calls unpublished
+  but whose content is proven merged shows `✓ safe ·merged` instead of a
+  warning.
+
 - Safer automatic branch deletion. When `remove.delete-branch` is on, a branch
   whose upstream is gone or stale — the normal state after a GitHub squash
   merge — is now still deleted without a confirmation prompt when its content
