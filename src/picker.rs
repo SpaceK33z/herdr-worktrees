@@ -555,7 +555,9 @@ fn render_query_aware_list(
     let mut out = restored;
     if pr_checkout {
         if let Some(number) = parse_pr_query(query) {
-            out = prepend_pr_row(out, number, colors);
+            if !list_shows_pr(&out, number) {
+                out = prepend_pr_row(out, number, colors);
+            }
         }
     }
     Ok(append_create_row(out, query, colors))
@@ -667,6 +669,18 @@ fn append_create_row(
     let display = format!("{query}  {action}");
     PickerRow::action(query, row::KIND_CREATE, &display).write_line(&mut filtered);
     filtered
+}
+
+/// True when some ranked row already displays this pull request (its `#N`
+/// cell): the PR is checked out, fetched to origin, or both, so picking that
+/// row does the job and the synthesized checkout action would be redundant.
+fn list_shows_pr(list: &str, number: u32) -> bool {
+    let marker = format!("#{number}");
+    list.lines().any(|line| {
+        line.split('\t')
+            .next_back()
+            .is_some_and(|display| display.contains(&marker))
+    })
 }
 
 /// Prepend the checkout-PR action row. It comes first so typing a bare number
@@ -1208,8 +1222,8 @@ fn find_worktree_path(repo: &str, branch: &str) -> Option<String> {
 mod tests {
     use super::{
         add_remote_tracking_worktree, append_create_row, atomic_replace_cache, build_fzf_bind,
-        entry_route, parse_pr_query, picker_footer, pr_head_name, prepend_pr_row,
-        refresh_helper_args, render_query_aware_list, restore_ranked_rows,
+        entry_route, list_shows_pr, parse_pr_query, picker_footer, pr_head_name,
+        prepend_pr_row, refresh_helper_args, render_query_aware_list, restore_ranked_rows,
         selected_creation_target, EntryRoute, PickerCache, PickerCommands,
         INTERNAL_FZF_FILTER_ARGS, MAIN_FZF_SEARCH_ARGS, PICKER_FOOTER,
     };
@@ -1509,6 +1523,35 @@ mod tests {
         assert_eq!(fields[2], "pr");
         assert!(fields[5].contains("⇄ checkout pull request"));
         assert_eq!(lines[1].split('\t').next(), Some("branch"));
+    }
+
+    #[test]
+    fn pr_action_row_is_skipped_when_a_row_already_shows_the_pr() {
+        if !fzf_available() {
+            eprintln!("skipping real fzf regression: fzf is unavailable");
+            return;
+        }
+        let colors = crate::theme::ThemeColors::default();
+        let cached = concat!(
+            "main\t/repo\tworktree\tclean\tclean\tmain\n",
+            "fix\t/fix\tremote\tclean\tclean\torigin/fix  #123\n",
+        );
+
+        let rendered = render_query_aware_list(cached, "#123", &colors, true).unwrap();
+        let lines: Vec<_> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2); // the matching origin row + create, no pr action row
+        assert!(lines
+            .iter()
+            .all(|line| line.split('\t').nth(2) != Some("pr")));
+    }
+
+    /// A bare number that only matches inside another PR's number (say `69`
+    /// against `#169`) must still get its action row.
+    #[test]
+    fn list_shows_pr_requires_the_full_hash_prefixed_number() {
+        let list = "fix\t/fix\tremote\tclean\tclean\torigin/fix #169\n";
+        assert!(!list_shows_pr(list, 69));
+        assert!(list_shows_pr(list, 169));
     }
 
     /// The query box accepts anything, so a typo used to reach `git worktree
