@@ -28,29 +28,32 @@ herdr plugin action invoke open --plugin worktrees
 changes. Re-link after changing `herdr-plugin.toml` because Herdr caches linked
 manifests.
 
-## Release checklist
+## Releasing
 
-1. Update `version` in `Cargo.toml` and `herdr-plugin.toml`.
-2. Update `Cargo.lock` with `cargo check`.
-3. Move user-visible changes into a dated section in `CHANGELOG.md`.
-4. Run the local checks above on a clean checkout.
-5. Test installation or linking with the oldest supported Herdr version when
-   compatibility-sensitive manifest or API behavior changed.
-6. Commit the release and create an annotated `vX.Y.Z` tag whose version matches
-   both manifests.
-7. Push the commit and tag. The release workflow validates the tag and creates
-   the GitHub release.
-8. Reinstall from GitHub and invoke each action:
+One command does everything — version bumps, lockfile, changelog dating,
+tag, and push:
 
-   ```bash
-   herdr plugin install SpaceK33z/herdr-worktrees --yes
-   herdr plugin action invoke open --plugin worktrees
-   herdr plugin action invoke open-base --plugin worktrees
-   herdr plugin action invoke remove --plugin worktrees
-   ```
+```bash
+scripts/release.sh <major|minor|patch|x.y.z>
+```
 
-9. Confirm the repository has the `herdr-plugin` GitHub topic so it appears in
-   the Herdr marketplace.
+It refuses to run on a dirty tree, off main, out of sync with origin, or with
+an empty Unreleased changelog section, so record user-visible changes there as
+you go.
+
+After pushing, the release workflow validates the tag against both manifests,
+runs the local checks, and creates the GitHub release. Then verify the install
+path:
+
+```bash
+herdr plugin install SpaceK33z/herdr-worktrees --yes
+herdr plugin action invoke open --plugin worktrees
+herdr plugin action invoke open-base --plugin worktrees
+herdr plugin action invoke remove --plugin worktrees
+```
+
+The repository keeps the `herdr-plugin` GitHub topic so it appears in the
+Herdr marketplace.
 
 The plugin is distributed as source. Herdr clones the tagged repository and
 runs `cargo build --release`; GitHub releases do not contain prebuilt binaries.
