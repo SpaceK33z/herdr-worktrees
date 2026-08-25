@@ -1,27 +1,54 @@
 name: Release
 
+# Release-please maintains a release PR from conventional commits. Merging it
+# cuts the release; the second job then re-validates the exact released commit.
+# Everything runs in this one workflow because events created with
+# GITHUB_TOKEN (the tag/release) do not trigger other workflows.
+
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Validate and publish
+  release-please:
+    name: Maintain release PR / cut release
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      sha: ${{ steps.release.outputs.sha }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  validate-release:
+    name: Validate released commit
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Check tag version
+      - name: Verify versions match the tag
         shell: bash
         run: |
           package_version=$(awk '
@@ -30,7 +57,7 @@ jobs:
             in_package && /^version = / { gsub(/["[:space:]]/, "", $3); print $3; exit }
           ' Cargo.toml)
           plugin_version=$(awk '/^version = /{gsub(/["[:space:]]/, "", $3); print; exit}' herdr-plugin.toml)
-          test "$GITHUB_REF_NAME" = "v$package_version"
+          test "v$package_version" = "${{ needs.release-please.outputs.tag_name }}"
           test "$package_version" = "$plugin_version" || {
             echo "Cargo.toml ($package_version) and herdr-plugin.toml ($plugin_version) disagree" >&2
             exit 1
@@ -40,7 +67,3 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
       - run: cargo package --locked
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

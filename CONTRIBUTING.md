@@ -30,20 +30,18 @@ manifests.
 
 ## Releasing
 
-One command does everything — version bumps, lockfile, changelog dating,
-tag, and push:
+Fully automated with
+[release-please](https://github.com/googleapis/release-please). Commit with
+[conventional commit](https://www.conventionalcommits.org/) messages — `fix:`
+bumps the patch version, `feat:` the minor, and `feat!:`/`BREAKING CHANGE:`
+the major. On every push to main, release-please opens or updates a release PR
+that bumps `Cargo.toml` and `herdr-plugin.toml`, dates a new `CHANGELOG.md`
+section generated from the commit subjects, and records the released version.
+Merging that PR cuts the release: it tags `vX.Y.Z`, publishes the GitHub
+release, and re-runs the full check suite (fmt, clippy, tests, build, package)
+against the released commit on Linux and macOS.
 
-```bash
-scripts/release.sh <major|minor|patch|x.y.z>
-```
-
-It refuses to run on a dirty tree, off main, out of sync with origin, or with
-an empty Unreleased changelog section, so record user-visible changes there as
-you go.
-
-After pushing, the release workflow validates the tag against both manifests,
-runs the local checks, and creates the GitHub release. Then verify the install
-path:
+After a release, verify the install path:
 
 ```bash
 herdr plugin install SpaceK33z/herdr-worktrees --yes
