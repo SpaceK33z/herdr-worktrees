@@ -126,10 +126,15 @@ For scripts and coding agents (never run raw `git worktree add`):
 
 ```bash
 herdr-worktrees create parser-fix          # prints the worktree path
-herdr-worktrees create parser-fix --json   # {path, branch, base, action, setup}
+herdr-worktrees create parser-fix --json   # {path, branch, base, action, setup, workspace}
 ```
 
-Flags: `--exact` (skip prefix), `--base <ref>`, `--no-setup`.
+Flags: `--exact` (skip prefix), `--base <ref>`, `--no-setup`, `--no-open`.
+
+When the repo is already open as a Herdr workspace, the created checkout is
+attached there (unfocused) per the configured `open-mode` — its own worktree
+space, or a tab inside the repo's workspace — exactly like creating through
+the popup does. Pass `--no-open` to skip that.
 
 ## Updating a worktree
 

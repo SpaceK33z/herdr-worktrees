@@ -1222,8 +1222,8 @@ fn find_worktree_path(repo: &str, branch: &str) -> Option<String> {
 mod tests {
     use super::{
         add_remote_tracking_worktree, append_create_row, atomic_replace_cache, build_fzf_bind,
-        entry_route, list_shows_pr, parse_pr_query, picker_footer, pr_head_name,
-        prepend_pr_row, refresh_helper_args, render_query_aware_list, restore_ranked_rows,
+        entry_route, list_shows_pr, parse_pr_query, picker_footer, pr_head_name, prepend_pr_row,
+        refresh_helper_args, render_query_aware_list, restore_ranked_rows,
         selected_creation_target, EntryRoute, PickerCache, PickerCommands,
         INTERNAL_FZF_FILTER_ARGS, MAIN_FZF_SEARCH_ARGS, PICKER_FOOTER,
     };

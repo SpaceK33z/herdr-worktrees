@@ -527,12 +527,13 @@ fn open_progress_pane(
     let pane = if targets.len() == 1 && config.open_mode() == "workspace" {
         let target = &targets[0];
         match herdr::worktree_workspace_id(&target.path, repo) {
-            Some(workspace) => herdr::open_tab_pane(Some(&workspace), &target.path, &label),
+            Some(workspace) => herdr::open_tab_pane(Some(&workspace), &target.path, &label, true),
             None => herdr::open_worktree_pane(
                 herdr::root_workspace(repo).as_deref(),
                 repo,
                 &target.path,
                 &label,
+                true,
             ),
         }
     } else {
@@ -541,7 +542,7 @@ fn open_progress_pane(
         } else {
             repo
         };
-        herdr::open_tab_pane(herdr::current_workspace().as_deref(), cwd, &label)
+        herdr::open_tab_pane(herdr::current_workspace().as_deref(), cwd, &label, true)
     };
 
     if let Some(pane) = pane {

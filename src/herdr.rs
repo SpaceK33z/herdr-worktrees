@@ -119,6 +119,7 @@ pub fn open_worktree_pane(
     repo: &str,
     path: &str,
     label: &str,
+    focus: bool,
 ) -> Option<String> {
     let mut args: Vec<String> = vec!["worktree".into(), "open".into()];
     if let Some(ws) = root_ws {
@@ -132,14 +133,14 @@ pub fn open_worktree_pane(
     args.push(path.to_string());
     args.push("--label".into());
     args.push(label.to_string());
-    args.push("--focus".into());
+    args.push(if focus { "--focus" } else { "--no-focus" }.into());
     json(&args)?["result"]["root_pane"]["pane_id"]
         .as_str()
         .map(String::from)
 }
 
 /// Open a checkout as a tab and return its root pane id.
-pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str) -> Option<String> {
+pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str, focus: bool) -> Option<String> {
     let mut args: Vec<String> = vec!["tab".into(), "create".into()];
     if let Some(ws) = ws {
         args.push("--workspace".into());
@@ -149,7 +150,7 @@ pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str) -> Option<String
     args.push(path.to_string());
     args.push("--label".into());
     args.push(label.to_string());
-    args.push("--focus".into());
+    args.push(if focus { "--focus" } else { "--no-focus" }.into());
     json(&args)?["result"]["root_pane"]["pane_id"]
         .as_str()
         .map(String::from)
@@ -158,10 +159,27 @@ pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str) -> Option<String
 /// Open a checkout in the configured `open-mode` and return its shell pane.
 pub fn open_checkout(mode: &str, repo: &str, path: &str, label: &str) -> Option<String> {
     if mode == "tab" {
-        open_tab_pane(current_workspace().as_deref(), path, label)
+        open_tab_pane(current_workspace().as_deref(), path, label, true)
     } else {
-        open_worktree_pane(root_workspace(repo).as_deref(), repo, path, label)
+        open_worktree_pane(root_workspace(repo).as_deref(), repo, path, label, true)
     }
+}
+
+/// Attach a checkout per the configured `open-mode`, unfocused: either as its
+/// own worktree space, or — in tab mode — as a tab inside the repo's already-
+/// open workspace. Returns the workspace id it landed in. This is what keeps a
+/// checkout created by a script or an agent from turning up later as a
+/// brand-new workspace instead of next to the rest of the repo.
+pub fn attach_checkout(mode: &str, repo: &str, path: &str, label: &str) -> Option<String> {
+    // The repo's own space is the anchor even in tab mode: a script has no
+    // business scattering tabs across whatever space happened to be focused.
+    let ws = root_workspace(repo)?;
+    if mode == "tab" {
+        open_tab_pane(Some(&ws), path, label, false)?;
+    } else {
+        open_worktree_pane(Some(&ws), repo, path, label, false)?;
+    }
+    Some(ws)
 }
 
 /// The repo's root workspace id (for `herdr worktree open`).

@@ -37,7 +37,9 @@ Notable user-visible changes are recorded here. This project follows
   CLI command, for coding agents and scripts. Applies `branch-prefix`, the
   `worktree-path` template, base resolution, and fetch-before-create, then
   copies `.worktreeinclude` entries and runs the setup script synchronously.
-  Supports `--base`, `--exact`, `--json`, and `--no-setup`.
+  When the repo is already open in Herdr, the checkout is attached to its
+  workspace per `open-mode`, unfocused (`--no-open` skips that). Supports
+  `--base`, `--exact`, `--json`, and `--no-setup`.
 - `.worktreeinclude` support: gitignored files named by that file — `.env`, a
   local secrets file, a dependency directory — are copied into a new worktree
   before the setup script runs, reflinked where the filesystem allows it.
@@ -53,6 +55,12 @@ Notable user-visible changes are recorded here. This project follows
   `github-prs = false` to opt out.
 
 ### Fixed
+
+- `herdr-worktrees create` never told Herdr about the new checkout, so unlike
+  the popup flow it stayed unattached: the next time anything opened its path,
+  Herdr spun up a brand-new workspace instead of a worktree space next to the
+  repo's own. The CLI now attaches the checkout to the repo's workspace right
+  after creating it — unfocused, honoring `open-mode`, best-effort.
 
 - `{{ user }}` expanded to the raw git `user.name`, so a full name like
   "Kees Kluskens" produced an invalid branch prefix and creation failed. The

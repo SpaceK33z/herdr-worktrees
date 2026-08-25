@@ -10,6 +10,7 @@
 
 use crate::config::{apply_branch_prefix, branch_short_name, Config};
 use crate::git;
+use crate::herdr;
 use crate::setup;
 use crate::tty;
 use crate::util;
@@ -136,11 +137,13 @@ fn refresh_base(config: &Config, repo: &str, base: &str) {
 }
 
 const USAGE: &str = concat!(
-    "usage: herdr-worktrees create <branch> [--base <ref>] [--exact] [--json] [--no-setup]\n",
+    "usage: herdr-worktrees create <branch> [--base <ref>] [--exact] [--json] [--no-setup] [--no-open]\n",
     "\n",
     "Creates a worktree with the plugin's settings applied: branch prefix,\n",
     "worktree-path template, base resolution, fetch-before-create,\n",
-    ".worktreeinclude copies, and the setup script. Prints the worktree path.\n",
+    ".worktreeinclude copies, and the setup script. When the repo is already\n",
+    "open as a Herdr workspace, the checkout is attached to it (unfocused);\n",
+    "pass --no-open to leave Herdr alone. Prints the worktree path.\n",
 );
 
 /// The `create` entry point: one argument naming the branch, plus flags.
@@ -150,6 +153,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
     let mut exact = false;
     let mut json = false;
     let mut no_setup = false;
+    let mut no_open = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -165,6 +169,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             "--exact" => exact = true,
             "--json" => json = true,
             "--no-setup" => no_setup = true,
+            "--no-open" => no_open = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 return Ok(());
@@ -188,6 +193,15 @@ pub fn run_cli(args: &[String]) -> Result<()> {
     let config = Config::load()?;
     let repo = git::repo_root()?.to_string_lossy().into_owned();
     let created = create(&config, &repo, &name, base.as_deref(), exact)?;
+
+    // Attach before setup runs: a failing setup leaves the worktree in place,
+    // and having it open next to the repo makes that failure visible instead
+    // of something an agent has to report secondhand.
+    let attached = if no_open {
+        None
+    } else {
+        herdr::attach_checkout(config.open_mode(), &repo, &created.path, &created.branch)
+    };
 
     let setup_summary = if no_setup || !setup::has_work(&repo, &config) {
         None
@@ -218,6 +232,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
                 "base": util::strip_remote(&created.base),
                 "action": created.action(),
                 "setup": setup_summary,
+                "workspace": attached,
             })
         );
     } else {
@@ -228,6 +243,9 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             util::strip_remote(&created.base),
             created.path
         );
+        if let Some(workspace) = attached {
+            println!("attached to herdr workspace {workspace}");
+        }
         if let Some(summary) = setup_summary {
             println!("{summary}");
         }
