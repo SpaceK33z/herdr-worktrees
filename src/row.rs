@@ -7,8 +7,8 @@
 
 use crate::status::SyncKind;
 
-/// Fields per row: branch, path, entry kind, sync kind, changes, display.
-pub const FIELD_COUNT: usize = 6;
+/// Fields per row: branch, path, entry kind, sync kind, changes, PR number, display.
+pub const FIELD_COUNT: usize = 7;
 
 /// fzf's field separator for both the interactive picker and the internal
 /// ranking filter.
@@ -16,11 +16,11 @@ pub const DELIMITER: &str = "--delimiter=\t";
 
 /// Only the last field is shown and searched; the rest is the payload the
 /// picker acts on.
-pub const WITH_NTH: &str = "--with-nth=6";
+pub const WITH_NTH: &str = "--with-nth=7";
 
 /// What fzf echoes back for the selected row: every field except the display
 /// one, joined by the delimiter (see [`PickerRow::parse_selection`]).
-pub const ACCEPT_NTH: &str = "--accept-nth=1,2,3,4,5";
+pub const ACCEPT_NTH: &str = "--accept-nth=1,2,3,4,5,6";
 
 /// Entry kinds. `create` and `pr` are action rows the picker appends to the
 /// ranked list rather than candidates the model produced.
@@ -41,6 +41,7 @@ pub struct PickerRow<'a> {
     pub entry_kind: &'a str,
     pub sync_kind: &'a str,
     pub changes: &'a str,
+    pub pr_number: Option<u32>,
     pub display: &'a str,
 }
 
@@ -54,6 +55,9 @@ impl<'a> PickerRow<'a> {
             entry_kind,
             sync_kind: "",
             changes: "",
+            pr_number: (entry_kind == KIND_PR)
+                .then(|| branch.parse().ok())
+                .flatten(),
             display,
         }
     }
@@ -69,6 +73,14 @@ impl<'a> PickerRow<'a> {
             entry_kind: fields.next()?,
             sync_kind: fields.next()?,
             changes: fields.next()?,
+            pr_number: {
+                let number = fields.next()?;
+                if number.is_empty() {
+                    None
+                } else {
+                    Some(number.parse().ok()?)
+                }
+            },
             display: fields.next()?,
         };
         fields.next().is_none().then_some(row)
@@ -86,6 +98,7 @@ impl<'a> PickerRow<'a> {
             entry_kind: fields.next().unwrap_or_default(),
             sync_kind: fields.next().unwrap_or_default(),
             changes: fields.next().unwrap_or_default(),
+            pr_number: fields.next().and_then(|number| number.parse().ok()),
             display: "",
         }
     }
@@ -102,12 +115,17 @@ impl<'a> PickerRow<'a> {
             entry_kind,
             sync_kind,
             changes,
+            pr_number,
             display,
         } = self;
         for field in [branch, path, entry_kind, sync_kind, changes] {
             out.push_str(field);
             out.push('\t');
         }
+        if let Some(number) = pr_number {
+            out.push_str(&number.to_string());
+        }
+        out.push('\t');
         out.push_str(display);
         out.push('\n');
     }
@@ -149,6 +167,7 @@ mod tests {
             entry_kind: "worktree",
             sync_kind: "ahead",
             changes: "clean",
+            pr_number: Some(169),
             display: "kees/fix  \x1b[33m↑1\x1b[0m",
         };
         let line = row.to_line();
@@ -159,10 +178,13 @@ mod tests {
     }
 
     #[test]
-    fn only_six_field_lines_parse_as_rows() {
+    fn only_seven_field_lines_parse_as_rows() {
         assert_eq!(PickerRow::parse("a\tb\tc"), None);
         assert_eq!(PickerRow::parse("a\tb\tc\td\te\tf\tg"), None);
-        assert_eq!(key_fields("a\tb\tc\td\te\tf"), Some("a\tb\tc\td\te"));
+        assert_eq!(
+            key_fields("a\tb\tc\td\te\t12\tf"),
+            Some("a\tb\tc\td\te\t12")
+        );
         assert_eq!(key_fields("a\tb\tc"), None);
     }
 
@@ -184,6 +206,6 @@ mod tests {
     #[test]
     fn an_action_row_has_a_branch_a_kind_and_a_display() {
         let row = PickerRow::action("7", super::KIND_PR, "#7  checkout");
-        assert_eq!(row.to_line(), "7\t\tpr\t\t\t#7  checkout\n");
+        assert_eq!(row.to_line(), "7\t\tpr\t\t\t7\t#7  checkout\n");
     }
 }

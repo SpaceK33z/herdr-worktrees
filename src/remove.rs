@@ -53,25 +53,24 @@ struct PreparedRemoval {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PublicationProof {
+struct RetentionProof {
     reference: String,
     oid: String,
 }
 
-/// Evidence that deleting a branch loses no work, in decreasing order of
-/// strength. The first variant carries a compare-and-swap proof; the others
-/// fall back to CAS on the branch HEAD itself (`update-ref -d <ref> <head>`),
-/// so a branch that moves between inspection and deletion is never deleted.
+/// Evidence that deleting a branch loses no work. Both safe variants retain
+/// their supporting ref/OID for the final branch-deletion transaction; only an
+/// explicitly authorized unpublished delete uses branch-HEAD-only CAS.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DeletionSafety {
     /// Every commit is on the upstream named by the proof; the delete
     /// transaction verifies its pinned OID before removing the branch.
-    Published(PublicationProof),
+    Published(RetentionProof),
     /// The branch's content already lives in the base branch — same commit,
     /// ancestor, empty diff, matching trees, or a merge that adds nothing —
     /// even though ancestry and upstream tracking cannot show it (squash
     /// merges, rebases). The string says which probe matched.
-    Integrated(String),
+    Integrated(String, RetentionProof),
     /// Commits may exist nowhere else; deletion needs explicit confirmation.
     Unpublished,
 }
@@ -410,7 +409,7 @@ fn inspect_candidate(
 fn deletion_safety_tag(safety: &DeletionSafety) -> Option<&'static str> {
     match safety {
         DeletionSafety::Published(_) => Some("pushed"),
-        DeletionSafety::Integrated(_) => Some("merged"),
+        DeletionSafety::Integrated(..) => Some("merged"),
         DeletionSafety::Unpublished => None,
     }
 }
@@ -688,7 +687,7 @@ fn inspect_target_in_records(
     let changes = inspect_changes(&target.path)?;
     let detached = record.branch.is_empty();
     let (safety, unpublished) = if config.delete_branch() && !detached {
-        let safety = branch_deletion_safety(config, repo, &record.branch)?;
+        let safety = branch_deletion_safety_at(config, repo, &record.branch, &record.head)?;
         let unpublished = matches!(safety, DeletionSafety::Unpublished);
         (Some(safety), unpublished)
     } else {
@@ -741,7 +740,13 @@ fn sync_has_unpublished(sync_kind: SyncKind) -> bool {
     !matches!(sync_kind, SyncKind::Synced | SyncKind::Behind)
 }
 
-fn branch_publication(repo: &str, branch: &str) -> Result<Option<PublicationProof>> {
+#[cfg(test)]
+fn branch_publication(repo: &str, branch: &str) -> Result<Option<RetentionProof>> {
+    let head = git::ref_oid(repo, &format!("refs/heads/{branch}")).context("branch disappeared")?;
+    branch_publication_at(repo, branch, &head)
+}
+
+fn branch_publication_at(repo: &str, branch: &str, head: &str) -> Result<Option<RetentionProof>> {
     let Some(upstream) = git::branch_upstream(repo, branch) else {
         // Failure to resolve an upstream is conservative: keeping the branch is
         // safe, deleting it needs explicit force confirmation.
@@ -761,7 +766,7 @@ fn branch_publication(repo: &str, branch: &str) -> Result<Option<PublicationProo
 
     // Compare against the captured object, not the mutable ref name. The same
     // OID is verified in the update-ref transaction before branch deletion.
-    let range = format!("{oid}..{branch}");
+    let range = format!("{oid}..{head}");
     let output = git::git_output(&["-C", repo, "rev-list", "--count", &range])
         .context("checking unpublished commits")?;
     if !output.status.success() {
@@ -774,7 +779,7 @@ fn branch_publication(repo: &str, branch: &str) -> Result<Option<PublicationProo
     if count > 0 {
         Ok(None)
     } else {
-        Ok(Some(PublicationProof {
+        Ok(Some(RetentionProof {
             reference: upstream,
             oid: oid.to_string(),
         }))
@@ -785,12 +790,33 @@ fn branch_publication(repo: &str, branch: &str) -> Result<Option<PublicationProo
 /// upstream is gone or stale can still be safe to delete when its content has
 /// already landed on the base branch (squash merges, rebases).
 fn branch_deletion_safety(config: &Config, repo: &str, branch: &str) -> Result<DeletionSafety> {
-    if let Some(proof) = branch_publication(repo, branch)? {
+    let head = git::ref_oid(repo, &format!("refs/heads/{branch}")).context("branch disappeared")?;
+    branch_deletion_safety_at(config, repo, branch, &head)
+}
+
+fn branch_deletion_safety_at(
+    config: &Config,
+    repo: &str,
+    branch: &str,
+    head: &str,
+) -> Result<DeletionSafety> {
+    if let Some(proof) = branch_publication_at(repo, branch, head)? {
         return Ok(DeletionSafety::Published(proof));
     }
-    Ok(branch_integration_reason(config, repo, branch)
-        .map(DeletionSafety::Integrated)
-        .unwrap_or(DeletionSafety::Unpublished))
+    if let Some(target) = integration_target(config, repo, branch) {
+        if let Some(oid) = git::ref_oid(repo, &target) {
+            if let Some(reason) = integration_reason_at(repo, branch, head, &target, &oid) {
+                return Ok(DeletionSafety::Integrated(
+                    reason,
+                    RetentionProof {
+                        reference: target,
+                        oid,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(DeletionSafety::Unpublished)
 }
 
 /// How many commits the patch-id squash-merge fallback is willing to walk on
@@ -813,12 +839,22 @@ const PATCH_ID_SCAN_MAX_COMMITS: usize = 500;
 /// branch-cleanup ladder, cheapest first; any single hit means deleting the
 /// ref loses no work. Every command is a plumbing query — nothing touches a
 /// working tree, and every failure conservatively reports "not integrated".
+#[cfg(test)]
 fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Option<String> {
     let local_ref = format!("refs/heads/{branch}");
     let branch_oid = git::ref_oid(repo, &local_ref)?;
     let target = integration_target(config, repo, branch)?;
     let target_oid = git::ref_oid(repo, &target)?;
+    integration_reason_at(repo, branch, &branch_oid, &target, &target_oid)
+}
 
+fn integration_reason_at(
+    repo: &str,
+    branch: &str,
+    branch_oid: &str,
+    target: &str,
+    target_oid: &str,
+) -> Option<String> {
     // 1. Same commit — the branch points at the base tip.
     if branch_oid == target_oid {
         return Some(format!("{branch} is at the same commit as {target}"));
@@ -831,25 +867,29 @@ fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Optio
         repo,
         "merge-base",
         "--is-ancestor",
-        &branch_oid,
-        &target_oid,
+        branch_oid,
+        target_oid,
     ]) {
         return Some(format!("{branch} is contained in {target}"));
     }
 
     // 3. No added changes — the diff from the merge-base is empty.
-    let base = merge_base(repo, &target_oid, &branch_oid);
+    let base = merge_base(repo, target_oid, branch_oid);
     if let Some(base) = &base {
         let range = format!("{base}..{branch_oid}");
-        let files = git::git_stdout(&["-C", repo, "diff", "--name-only", &range]);
-        if files.trim().is_empty() {
+        let files = git::git_output(&["-C", repo, "diff", "--name-only", &range]).ok()?;
+        // Failed inspection is never positive integration evidence.
+        if !files.status.success() {
+            return None;
+        }
+        if files.stdout.is_empty() {
             return Some(format!("{branch} adds no file changes to {target}"));
         }
     }
 
     // 4. Trees match — identical content despite different history.
-    let branch_tree = commit_tree(repo, &branch_oid);
-    let target_tree = commit_tree(repo, &target_oid);
+    let branch_tree = commit_tree(repo, branch_oid);
+    let target_tree = commit_tree(repo, target_oid);
     if branch_tree.is_some() && branch_tree == target_tree {
         return Some(format!("{branch} content matches {target}"));
     }
@@ -868,8 +908,8 @@ fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Optio
             repo,
             "merge-tree",
             "--write-tree",
-            &target_oid,
-            &branch_oid,
+            target_oid,
+            branch_oid,
         ]),
     ) {
         (Some(target_tree), Ok(output)) if output.status.success() => {
@@ -890,7 +930,7 @@ fn branch_integration_reason(config: &Config, repo: &str, branch: &str) -> Optio
     if conflicted {
         if let Some(base) = base.as_deref() {
             if let Some(reason) =
-                is_squash_merged_via_patch_id(repo, &target, branch, &branch_oid, &target_oid, base)
+                is_squash_merged_via_patch_id(repo, target, branch, branch_oid, target_oid, base)
             {
                 return Some(reason);
             }
@@ -969,7 +1009,14 @@ fn is_squash_merged_via_patch_id(
 fn integration_target(config: &Config, repo: &str, branch: &str) -> Option<String> {
     let head = git::git_stdout(&["-C", repo, "symbolic-ref", "--quiet", "--short", "HEAD"]);
     let target = git::resolve_base_ref(config, repo, head.trim());
-    (target != branch).then_some(target)
+    [
+        format!("refs/heads/{target}"),
+        format!("refs/remotes/{target}"),
+        target,
+    ]
+    .into_iter()
+    .find(|reference| reference.starts_with("refs/") && git::ref_exists(repo, reference))
+    .filter(|reference| reference != &format!("refs/heads/{branch}"))
 }
 
 fn merge_base(repo: &str, a: &str, b: &str) -> Option<String> {
@@ -1299,6 +1346,7 @@ pub fn run_background_batch(args: &[String]) -> Result<()> {
                     freed_suffix(size)
                 ));
                 if let Some(warning) = warning {
+                    report_progress(&format!("⚠ '{}': {warning}", target.branch));
                     failures.push(format!("'{}': {warning}", target.branch));
                 }
             }
@@ -1356,13 +1404,15 @@ fn validate_and_delete(
         anyhow::bail!("safety state changed after confirmation; worktree was kept");
     }
     // A confirmed unpublished risk deletes with HEAD-only CAS; otherwise a
-    // fresh upstream proof (recomputed above, so it reflects the ref state at
+    // fresh retention proof (recomputed above, so it reflects the ref state at
     // deletion time) upgrades the delete to a verified transaction.
-    let publication_proof = if target.authorized_risk.is_some_and(|risk| risk.unpublished) {
+    let retention_proof = if target.authorized_risk.is_some_and(|risk| risk.unpublished) {
         None
     } else {
         match &current.safety {
-            Some(DeletionSafety::Published(proof)) => Some(proof),
+            Some(DeletionSafety::Published(proof) | DeletionSafety::Integrated(_, proof)) => {
+                Some(proof)
+            }
             _ => None,
         }
     };
@@ -1370,7 +1420,7 @@ fn validate_and_delete(
         target,
         config,
         repo,
-        publication_proof,
+        retention_proof,
         current.kept_by_checkout.as_deref(),
     )
 }
@@ -1381,9 +1431,17 @@ fn perform_delete(
     target: &PreparedRemoval,
     config: &Config,
     repo: &str,
-    publication_proof: Option<&PublicationProof>,
+    retention_proof: Option<&RetentionProof>,
     kept_by_checkout: Option<&str>,
 ) -> Result<(u64, Option<String>)> {
+    // Keep Git's ordinary checkout occupancy guard continuously present across
+    // unregistering the real worktree and deleting the ref. A raw update-ref
+    // transaction alone has no knowledge of worktrees.
+    let reservation = if config.delete_branch() && target.branch != "(detached)" {
+        Some(BranchReservation::acquire(repo, target)?)
+    } else {
+        None
+    };
     let wsid = herdr::worktree_workspace_id(&target.path, repo);
 
     let mut args = vec!["-C", repo, "worktree", "remove"];
@@ -1399,12 +1457,22 @@ fn perform_delete(
     }
 
     if config.delete_branch() && target.branch != "(detached)" {
-        let kept = if let Some(sibling) = kept_by_checkout {
+        let occupants = registered_worktrees(repo)?;
+        let sibling = occupants.iter().find(|record| {
+            record.branch == target.branch
+                && reservation
+                    .as_ref()
+                    .is_none_or(|guard| record.path != guard.path)
+        });
+        let kept = if let Some(sibling) = sibling
+            .map(|record| record.path.as_str())
+            .or(kept_by_checkout)
+        {
             Some(format!(
                 "worktree removed, but branch '{}' is still checked out at {sibling}, so it was kept",
                 target.branch
             ))
-        } else if !delete_branch_ref(repo, target, publication_proof) {
+        } else if !delete_branch_ref(repo, target, retention_proof) {
             Some(
                 "worktree removed, but branch or publication state changed, so the branch was kept"
                     .to_string(),
@@ -1412,6 +1480,9 @@ fn perform_delete(
         } else {
             None
         };
+        if let Some(guard) = reservation {
+            guard.release()?;
+        }
         if let Some(note) = kept {
             return Ok((freed, Some(note)));
         }
@@ -1420,13 +1491,141 @@ fn perform_delete(
     Ok((freed, None))
 }
 
+/// A no-checkout, locked Git worktree reserves occupancy, not just a plugin
+/// mutex. Normal `switch`/`checkout`/`worktree add` honor it. Explicit force,
+/// --ignore-other-worktrees and direct HEAD plumbing bypass Git's protection
+/// and are outside this protocol. The target checkout itself must not be
+/// concurrently switched/rewritten: pre-reservation ABA operations are not a
+/// global Git transaction. HEAD/status revalidation rejects observed changes.
+/// No hooks, setup or Herdr run here.
+struct BranchReservation {
+    repo: String,
+    path: String,
+    parent: std::path::PathBuf,
+    head: String,
+    released: bool,
+    registered: bool,
+}
+
+impl BranchReservation {
+    fn acquire(repo: &str, target: &PreparedRemoval) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "herdr-branch-reservation-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::DirBuilder::new().mode(0o700).create(&parent)?;
+        let parent = std::fs::canonicalize(parent)?;
+        let path = parent.join("checkout").to_string_lossy().into_owned();
+        let mut guard = Self {
+            repo: repo.into(),
+            path,
+            parent,
+            head: target.head.clone(),
+            released: false,
+            registered: false,
+        };
+        if !git::git_success(&[
+            "-C",
+            repo,
+            "-c",
+            "core.hooksPath=/dev/null",
+            "worktree",
+            "add",
+            "--detach",
+            "--no-checkout",
+            "--lock",
+            "--reason",
+            "herdr branch deletion reservation",
+            &guard.path,
+            &target.head,
+        ]) {
+            guard.registered = registered_worktrees(repo)
+                .is_ok_and(|records| records.iter().any(|r| r.path == guard.path));
+            anyhow::bail!(
+                "could not reserve branch occupancy; worktree and branch kept (reservation {})",
+                guard.path
+            );
+        }
+        guard.registered = true;
+        if !git::git_success(&[
+            "-C",
+            &guard.path,
+            "symbolic-ref",
+            "HEAD",
+            &format!("refs/heads/{}", target.branch),
+        ]) {
+            anyhow::bail!("could not reserve branch HEAD; worktree and branch kept");
+        }
+        // Verify the original still holds the pinned branch before removing it.
+        let records = registered_worktrees(repo)?;
+        if !records
+            .iter()
+            .any(|r| r.path == target.path && r.branch == target.branch && r.head == target.head)
+        {
+            guard.cleanup()?;
+            anyhow::bail!("worktree changed while reserving branch; kept");
+        }
+        Ok(guard)
+    }
+
+    fn cleanup(&mut self) -> Result<()> {
+        if self.released {
+            return Ok(());
+        }
+        if !self.registered {
+            if Path::new(&self.path).exists() {
+                std::fs::remove_dir(&self.path)?;
+            }
+            std::fs::remove_dir(&self.parent)?;
+            self.released = true;
+            return Ok(());
+        }
+        // Detach first: after a successful deletion the symbolic HEAD is unborn.
+        // --no-deref never recreates the branch we just deleted.
+        let detached = git::git_success(&[
+            "-C",
+            &self.path,
+            "update-ref",
+            "--no-deref",
+            "HEAD",
+            &self.head,
+        ]);
+        if !detached
+            || !git::git_success(&[
+                "-C", &self.repo, "worktree", "remove", "--force", "--force", &self.path,
+            ])
+        {
+            anyhow::bail!("reservation cleanup failed at {} (pinned commit {}); recover with git -C {} update-ref --no-deref HEAD {}, then git -C {} worktree remove --force --force {}", self.path, self.head, self.path, self.head, self.repo, self.path);
+        }
+        std::fs::remove_dir(&self.parent)?;
+        self.released = true;
+        Ok(())
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.cleanup()
+    }
+}
+
+impl Drop for BranchReservation {
+    fn drop(&mut self) {
+        if let Err(error) = self.cleanup() {
+            eprintln!("{error:#}");
+        }
+    }
+}
+
 fn delete_branch_ref(
     repo: &str,
     target: &PreparedRemoval,
-    publication_proof: Option<&PublicationProof>,
+    retention_proof: Option<&RetentionProof>,
 ) -> bool {
     let local_ref = format!("refs/heads/{}", target.branch);
-    let Some(proof) = publication_proof else {
+    let Some(proof) = retention_proof else {
         return git::git_success(&["-C", repo, "update-ref", "-d", &local_ref, &target.head]);
     };
 
@@ -1621,7 +1820,7 @@ mod tests {
         parse_pid_header, parse_targets, perform_delete, process_is_running, removal_risk,
         remove_fzf_args, render_remove_candidates, risk_is_covered, sync_has_unpublished,
         validate_and_delete, ChangeCounts, DeletionSafety, PreparedRemoval, ProgressOutcome,
-        PublicationProof, RemovalRisk, RemovalTarget, SyncKind,
+        RemovalRisk, RemovalTarget, RetentionProof, SyncKind,
     };
     use crate::config::Config;
     use indicatif::ProgressBar;
@@ -2011,7 +2210,7 @@ mod tests {
     #[test]
     fn safety_tags_map_from_deletion_verdicts() {
         assert_eq!(
-            deletion_safety_tag(&DeletionSafety::Published(PublicationProof {
+            deletion_safety_tag(&DeletionSafety::Published(RetentionProof {
                 reference: "refs/remotes/origin/main".to_string(),
                 oid: "abc".to_string(),
             })),
@@ -2019,7 +2218,11 @@ mod tests {
         );
         assert_eq!(
             deletion_safety_tag(&DeletionSafety::Integrated(
-                "feature content matches main".to_string()
+                "feature content matches main".to_string(),
+                RetentionProof {
+                    reference: "refs/heads/main".into(),
+                    oid: "abc".into()
+                }
             )),
             Some("merged")
         );
@@ -2071,7 +2274,7 @@ mod tests {
             ],
         );
 
-        let config = Config::default();
+        let config = delete_branch_config();
         let state = root.join("state");
         let repo_str = repo.to_str().unwrap();
         let enriched = render_remove_candidates(repo_str, &config, &state, true);
@@ -2170,7 +2373,13 @@ mod tests {
         let repo_str = repo.to_str().unwrap();
         assert_eq!(
             branch_deletion_safety(&config, repo_str, "feature").unwrap(),
-            DeletionSafety::Integrated("feature is at the same commit as main".to_string())
+            DeletionSafety::Integrated(
+                "feature is at the same commit as refs/heads/main".to_string(),
+                RetentionProof {
+                    reference: "refs/heads/main".into(),
+                    oid: git_output(&repo, &["rev-parse", "main"])
+                }
+            )
         );
         git(
             &repo,

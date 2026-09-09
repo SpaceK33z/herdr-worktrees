@@ -80,6 +80,11 @@ carry over; entries are copied only when git also ignores them, before the setup
 script runs. Copies are reflinked where supported. Read by Claude Code and
 Worktrunk too. Disable with `worktree-include = false`.
 
+Symlinks below the destination checkout root are never followed when copying.
+Source group and supported ACLs/security metadata are preserved before permissions
+are applied; failures are reported rather than silently widening access.
+Hard-linked files become independent copies, not shared inodes.
+
 ### Pull request checkout
 
 Typing a PR number checks out its head branch into a worktree. Same-repo PRs
@@ -104,8 +109,8 @@ space, or a tab inside the repo's workspace — exactly like creating through
 the popup does. **Reuse that attachment when launching an agent; do not create
 another workspace, tab, or split for the same checkout.**
 
-On success, `--json` writes one JSON object to stdout; Git progress and setup
-script output go to stderr. The object contains `path`, `branch`, `base`,
+On success, `--json` writes one JSON object to stdout; Git/include progress and
+setup script output go to stderr. The object contains `path`, `branch`, `base`,
 `action`, `setup`, `attachedWorkspaceId`, and `rootPaneId`. Start the requested
 agent in the returned `rootPaneId`, which already has the checkout as its cwd:
 
@@ -134,6 +139,9 @@ in place; resolve the failure instead of rerunning creation.
 On conflicts the plugin starts a coding agent via `herdr agent start` with a
 task describing the merge; with the default `agent = "ask"` an fzf prompt picks
 the agent first. Also works on worktrees already stopped mid-merge/rebase.
+Conflicts while restoring an autostash are handled separately: no merge/rebase
+continuation is attempted when that operation has already finished, and the
+retained stash is left alone until the restored work is verified.
 
 ## Removing worktrees
 
@@ -145,7 +153,14 @@ verdict after an untracked-file scan: green `✓ safe`, red `⚠ dirty`, yellow
 With it on, a branch is deleted without confirmation when its content is
 already on the base branch — fully pushed, or landed via squash merge/rebase
 (detected by content probes up to a simulated `git merge-tree`). A branch
-still checked out in another worktree is never deleted.
+still checked out in another worktree is kept.
+
+During branch deletion, a temporary locked reservation worktree blocks ordinary
+sibling checkout/worktree-add operations until the branch and its supporting refs
+have been verified and deletion finishes. Do not concurrently switch or rewrite
+the checkout being removed, or bypass Git's occupancy checks with force flags or
+low-level ref/HEAD commands. Failed reservation cleanup reports its path and a
+recovery command; it is not silently discarded.
 
 ## Configuration
 

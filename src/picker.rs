@@ -138,6 +138,10 @@ fn open_selected_pr(selection: Option<PickerRow>, repo: &str) -> Result<AfterAct
 
 /// ctrl-d: delete the selected worktree, then redraw the picker in place.
 fn delete_selected(selection: Option<PickerRow>, context: &PickerContext) -> Result<AfterAction> {
+    // Guard the action boundary, before confirmation, logs, panes or worker launch.
+    if context.dry_run {
+        return Ok(AfterAction::Redraw);
+    }
     if let Some(row) = selection.filter(|row| {
         entry_route(row.entry_kind) == EntryRoute::Worktree
             && !row.path.is_empty()
@@ -675,12 +679,9 @@ fn append_create_row(
 /// cell): the PR is checked out, fetched to origin, or both, so picking that
 /// row does the job and the synthesized checkout action would be redundant.
 fn list_shows_pr(list: &str, number: u32) -> bool {
-    let marker = format!("#{number}");
-    list.lines().any(|line| {
-        line.split('\t')
-            .next_back()
-            .is_some_and(|display| display.contains(&marker))
-    })
+    list.lines()
+        .filter_map(PickerRow::parse)
+        .any(|row| row.pr_number == Some(number))
 }
 
 /// Prepend the checkout-PR action row. It comes first so typing a bare number
@@ -891,14 +892,16 @@ fn checkout_pr_worktree(context: &PickerContext, number: u32) -> Result<()> {
         .map_err(|error| anyhow!("could not resolve pull request #{number}: {error}"))?;
     let branch = target.head_ref.as_str();
 
-    // Fast path: the PR's branch already has a worktree — just switch to it.
+    // A same-named fork branch is not the same branch. Validate provenance
+    // and the pinned head even on the existing-worktree fast path.
     if let Some(path) = find_worktree_path(repo, branch) {
+        verify_pr_checkout_identity(&target, branch, repo)?;
         return switch_worktree(context, &path, branch);
     }
 
     // Fork PRs contain untrusted code and run the setup script in that
     // checkout; confirm before fetching.
-    if target.is_cross_repo && !confirm_fork_checkout(number, branch) {
+    if target.is_cross_repo && !context.dry_run && !confirm_fork_checkout(number, branch) {
         return Ok(());
     }
 
@@ -930,6 +933,29 @@ fn checkout_pr_worktree(context: &PickerContext, number: u32) -> Result<()> {
     Ok(())
 }
 
+fn verify_pr_checkout_identity(
+    target: &pr::PullRequestTarget,
+    branch: &str,
+    repo: &str,
+) -> Result<()> {
+    let provenance = pr::fork_repository(repo, branch);
+    let identity_matches = if target.is_cross_repo {
+        provenance
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&target.head_repository))
+    } else {
+        provenance.is_none()
+    };
+    if !identity_matches
+        || (target.is_cross_repo
+            && git::ref_oid(repo, &format!("refs/heads/{branch}")).as_deref()
+                != Some(&target.head_oid))
+    {
+        bail!("local branch '{branch}' does not identify pull request #{} from {}; rename the unrelated branch before checkout", target.number, target.head_repository);
+    }
+    Ok(())
+}
+
 fn confirm_fork_checkout(number: u32, branch: &str) -> bool {
     let prompt = format!(
         "checkout #{number} from a fork ({branch})?\n\n\
@@ -953,6 +979,7 @@ fn checkout_same_repo_pr(
     repo: &str,
 ) -> Confirmed {
     if git::ref_exists(repo, &format!("refs/heads/{branch}")) {
+        verify_pr_checkout_identity(target, branch, repo)?;
         if !reconcile_local_pr_branch(target, branch, repo)? {
             return Ok(false);
         }
@@ -1062,13 +1089,21 @@ fn checkout_fork_pr(
     branch: &str,
     repo: &str,
 ) -> Confirmed {
-    let temp_ref = format!("refs/herdr-worktrees/pr-{number}");
+    let local_ref = format!("refs/heads/{branch}");
+    if git::ref_exists(repo, &local_ref) {
+        verify_pr_checkout_identity(target, branch, repo)?;
+    }
+    let temp_ref = format!("refs/herdr-worktrees/pr-{number}-{}", std::process::id());
     let refspec = format!("refs/pull/{number}/head:{temp_ref}");
     if !git::git_inherit(&["-C", repo, "fetch", "origin", &refspec]) {
         bail!("could not fetch pull request #{number} from origin");
     }
 
-    let local_ref = format!("refs/heads/{branch}");
+    let fetched = git::ref_oid(repo, &temp_ref);
+    if fetched.as_deref() != Some(&target.head_oid) {
+        let _ = git::delete_ref(repo, &temp_ref);
+        bail!("pull request #{number} changed during fetch; retry checkout");
+    }
     let result = if git::ref_exists(repo, &local_ref) {
         if git::ref_oid(repo, &local_ref).as_deref() == Some(target.head_oid.as_str()) {
             worktree_add(&["-C", repo, "worktree", "add", path, branch])
@@ -1084,7 +1119,17 @@ fn checkout_fork_pr(
     // The temporary ref goes regardless: it exists only for the `worktree add`
     // above, so `?` must not skip past this.
     let _ = git::delete_ref(repo, &temp_ref);
-    result.map(|()| true)
+    result?;
+    if !git::git_success(&[
+        "-C",
+        repo,
+        "config",
+        &format!("branch.{branch}.herdr-pr-repository"),
+        &target.head_repository,
+    ]) {
+        bail!("checkout created, but could not record fork identity; setup was not run");
+    }
+    Ok(true)
 }
 
 use create::worktree_add;
@@ -1103,6 +1148,11 @@ fn create_worktree(
 ) -> Result<()> {
     let repo = context.repo;
     let config = context.config;
+    if !context.dry_run {
+        let created = create::create(config, repo, name, Some(base), exact_branch)?;
+        open_and_setup_worktree(&created.path, &created.branch, &created.base, repo, config);
+        return Ok(());
+    }
     let user = git::resolve_user(repo);
     let prefix = config.resolved_prefix(&user);
     let final_branch = if exact_branch {
@@ -1113,18 +1163,11 @@ fn create_worktree(
     let short = branch_short_name(&final_branch, &prefix);
     let path = config.render_worktree_path(&final_branch, &short, base, repo, &user);
 
-    if context.dry_run {
-        if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
-            println!("checkout {final_branch} at {path}");
-        } else {
-            println!("create {final_branch} from {base} at {path}");
-        }
-        return Ok(());
+    if git::ref_exists(repo, &format!("refs/heads/{final_branch}")) {
+        println!("checkout {final_branch} at {path}");
+    } else {
+        println!("create {final_branch} from {base} at {path}");
     }
-
-    create::create(config, repo, name, Some(base), exact_branch)?;
-
-    open_and_setup_worktree(&path, &final_branch, base, repo, config);
     Ok(())
 }
 
@@ -1294,7 +1337,7 @@ mod tests {
     fn internal_filter_is_literal_and_uses_visible_protocol_field() {
         assert_eq!(
             INTERNAL_FZF_FILTER_ARGS,
-            ["--no-extended", "--ansi", "--delimiter=\t", "--with-nth=6"]
+            ["--no-extended", "--ansi", "--delimiter=\t", "--with-nth=7"]
         );
     }
 
@@ -1387,9 +1430,9 @@ mod tests {
     fn query_aware_list_ranks_real_rows_then_appends_styled_create_row() {
         let colors = crate::theme::ThemeColors::default();
         let cached = concat!(
-            "weak\t/weak\tbranch\tclean\tclean\tproject foo suffix\n",
-            "strong\t/strong\tbranch\tclean\tclean\tfoo\n",
-            "miss\t/miss\tbranch\tclean\tclean\tbar\n",
+            "weak\t/weak\tbranch\tclean\tclean\t\tproject foo suffix\n",
+            "strong\t/strong\tbranch\tclean\tclean\t\tfoo\n",
+            "miss\t/miss\tbranch\tclean\tclean\t\tbar\n",
         );
         assert_eq!(
             render_query_aware_list(cached, "", &colors, false).unwrap(),
@@ -1397,8 +1440,8 @@ mod tests {
         );
 
         let filtered = concat!(
-            "strong\t/strong\tbranch\tclean\tclean\tfoo\n",
-            "weak\t/weak\tbranch\tclean\tclean\tproject foo suffix\n",
+            "strong\t/strong\tbranch\tclean\tclean\t\tfoo\n",
+            "weak\t/weak\tbranch\tclean\tclean\t\tproject foo suffix\n",
         );
         let rendered = append_create_row(filtered.to_string(), "foo", &colors);
         let lines: Vec<_> = rendered.lines().collect();
@@ -1407,14 +1450,14 @@ mod tests {
         assert_eq!(lines[1].split('\t').next(), Some("weak"));
 
         let fields: Vec<_> = lines.last().unwrap().split('\t').collect();
-        assert_eq!(fields.len(), 6);
+        assert_eq!(fields.len(), 7);
         assert_eq!(fields[0], "foo");
         assert_eq!(fields[1], "");
         assert_eq!(fields[2], "create");
         assert_eq!(fields[3], "");
         assert_eq!(fields[4], "");
-        assert!(fields[5].contains("＋ create worktree"));
-        assert!(fields[5].contains("\x1b[1;"));
+        assert!(fields[6].contains("＋ create worktree"));
+        assert!(fields[6].contains("\x1b[1;"));
     }
 
     #[test]
@@ -1425,8 +1468,8 @@ mod tests {
         }
 
         let colors = crate::theme::ThemeColors::default();
-        let weak = "weak\t/weak\tbranch\tclean\tclean\t\x1b]8;;https://example.test/weak\x1b\\\x1b[31mproject foo suffix\x1b[0m\x1b]8;;\x1b\\";
-        let strong = "strong\t/strong\tbranch\tclean\tclean\t\x1b]8;;https://example.test/strong\x1b\\\x1b[32mfoo\x1b[0m\x1b]8;;\x1b\\";
+        let weak = "weak\t/weak\tbranch\tclean\tclean\t\t\x1b]8;;https://example.test/weak\x1b\\\x1b[31mproject foo suffix\x1b[0m\x1b]8;;\x1b\\";
+        let strong = "strong\t/strong\tbranch\tclean\tclean\t\t\x1b]8;;https://example.test/strong\x1b\\\x1b[32mfoo\x1b[0m\x1b]8;;\x1b\\";
         let cached = format!("{weak}\n{strong}\n");
 
         let rendered = render_query_aware_list(&cached, "foo", &colors, false).unwrap();
@@ -1443,16 +1486,16 @@ mod tests {
     #[test]
     fn ranked_row_restoration_handles_duplicate_keys_deterministically() {
         let cached = concat!(
-            "same\t/path\tbranch\tclean\tclean\t\x1b[31mfirst\x1b[0m\n",
-            "same\t/path\tbranch\tclean\tclean\t\x1b[32msecond\x1b[0m\n",
+            "same\t/path\tbranch\tclean\tclean\t\t\x1b[31mfirst\x1b[0m\n",
+            "same\t/path\tbranch\tclean\tclean\t\t\x1b[32msecond\x1b[0m\n",
         );
         let filtered = concat!(
-            "same\t/path\tbranch\tclean\tclean\tsecond\n",
-            "same\t/path\tbranch\tclean\tclean\tfirst\n",
+            "same\t/path\tbranch\tclean\tclean\t\tsecond\n",
+            "same\t/path\tbranch\tclean\tclean\t\tfirst\n",
         );
         let restored = concat!(
-            "same\t/path\tbranch\tclean\tclean\t\x1b[32msecond\x1b[0m\n",
-            "same\t/path\tbranch\tclean\tclean\t\x1b[31mfirst\x1b[0m\n",
+            "same\t/path\tbranch\tclean\tclean\t\t\x1b[32msecond\x1b[0m\n",
+            "same\t/path\tbranch\tclean\tclean\t\t\x1b[31mfirst\x1b[0m\n",
         );
         assert_eq!(restore_ranked_rows(cached, filtered).unwrap(), restored);
         assert!(restore_ranked_rows(cached, "missing\t/key\tbranch\t\t\trow\n").is_err());
@@ -1470,13 +1513,13 @@ mod tests {
     fn query_aware_list_treats_operator_like_queries_literally_and_appends_create() {
         let colors = crate::theme::ThemeColors::default();
         for query in ["foo$", "!foo", "^foo"] {
-            let filtered = format!("literal\t/literal\tbranch\tclean\tclean\t{query}\n");
+            let filtered = format!("literal\t/literal\tbranch\tclean\tclean\t\t{query}\n");
             let rendered = append_create_row(filtered, query, &colors);
             let lines: Vec<_> = rendered.lines().collect();
             assert_eq!(lines.len(), 2, "query {query:?}: {rendered:?}");
             assert_eq!(lines[0].split('\t').next(), Some("literal"));
             let create: Vec<_> = lines[1].split('\t').collect();
-            assert_eq!(create.len(), 6);
+            assert_eq!(create.len(), 7);
             assert_eq!(create[0], query);
             assert_eq!(create[2], "create");
         }
@@ -1485,11 +1528,11 @@ mod tests {
     #[test]
     fn query_aware_list_omits_create_for_unsafe_queries() {
         let colors = crate::theme::ThemeColors::default();
-        let cached = "main\t/repo\tworktree\tclean\tclean\tmain\n";
+        let cached = "main\t/repo\tworktree\tclean\tclean\t\tmain\n";
         for unsafe_query in ["tab\there", "line\nfeed", "carriage\rreturn", "escape\x1b"] {
             let rendered = render_query_aware_list(cached, unsafe_query, &colors, false).unwrap();
             assert_eq!(rendered, cached);
-            assert!(rendered.lines().all(|line| line.split('\t').count() == 6));
+            assert!(rendered.lines().all(|line| line.split('\t').count() == 7));
         }
     }
 
@@ -1510,18 +1553,18 @@ mod tests {
     fn prepend_pr_row_puts_the_row_before_existing_rows() {
         let colors = crate::theme::ThemeColors::default();
         let list = prepend_pr_row(
-            "branch\t/p\tbranch\tclean\tclean\tbranch\n".to_string(),
+            "branch\t/p\tbranch\tclean\tclean\t\tbranch\n".to_string(),
             7,
             &colors,
         );
         let lines: Vec<_> = list.lines().collect();
         assert_eq!(lines.len(), 2);
         let fields: Vec<_> = lines[0].split('\t').collect();
-        assert_eq!(fields.len(), 6);
+        assert_eq!(fields.len(), 7);
         assert_eq!(fields[0], "7");
         assert_eq!(fields[1], "");
         assert_eq!(fields[2], "pr");
-        assert!(fields[5].contains("⇄ checkout pull request"));
+        assert!(fields[6].contains("⇄ checkout pull request"));
         assert_eq!(lines[1].split('\t').next(), Some("branch"));
     }
 
@@ -1533,8 +1576,8 @@ mod tests {
         }
         let colors = crate::theme::ThemeColors::default();
         let cached = concat!(
-            "main\t/repo\tworktree\tclean\tclean\tmain\n",
-            "fix\t/fix\tremote\tclean\tclean\torigin/fix  #123\n",
+            "main\t/repo\tworktree\tclean\tclean\t\tmain\n",
+            "fix\t/fix\tremote\tclean\tclean\t123\torigin/fix  #123\n",
         );
 
         let rendered = render_query_aware_list(cached, "#123", &colors, true).unwrap();
@@ -1549,7 +1592,7 @@ mod tests {
     /// against `#169`) must still get its action row.
     #[test]
     fn list_shows_pr_requires_the_full_hash_prefixed_number() {
-        let list = "fix\t/fix\tremote\tclean\tclean\torigin/fix #169\n";
+        let list = "fix\t/fix\tremote\tclean\tclean\t169\torigin/fix #169\n";
         assert!(!list_shows_pr(list, 69));
         assert!(list_shows_pr(list, 169));
     }
@@ -1582,7 +1625,7 @@ mod tests {
             return;
         }
         let colors = crate::theme::ThemeColors::default();
-        let cached = "main\t/repo\tworktree\tclean\tclean\tmain\n";
+        let cached = "main\t/repo\tworktree\tclean\tclean\t\tmain\n";
 
         let enabled = render_query_aware_list(cached, "123", &colors, true).unwrap();
         let lines: Vec<_> = enabled.lines().collect();
@@ -1684,5 +1727,193 @@ mod tests {
         );
 
         std::fs::remove_dir_all(tmp).ok();
+    }
+    #[test]
+    fn dry_run_delete_action_stops_before_inspection_or_worker_launch() {
+        let config = crate::config::Config::default();
+        let context = super::PickerContext {
+            config: &config,
+            repo: "/does-not-exist",
+            dry_run: true,
+        };
+        let row = super::PickerRow::parse_selection("topic\t/also-does-not-exist\tworktree");
+        // A real dispatch would fail while inspecting this path (and could
+        // launch mutation commands for a real path). The action boundary exits.
+        assert!(matches!(
+            super::delete_selected(Some(row), &context).unwrap(),
+            super::AfterAction::Redraw
+        ));
+    }
+
+    #[test]
+    fn pr_numbers_are_structured_not_prefixes_or_branch_display_markers() {
+        let row = super::PickerRow {
+            branch: "feature-#16",
+            path: "/wt",
+            entry_kind: "worktree",
+            sync_kind: "",
+            changes: "",
+            pr_number: Some(169),
+            display: "feature-#16  #169",
+        };
+        let list = row.to_line();
+        assert!(!list_shows_pr(&list, 16));
+        assert!(!list_shows_pr(&list, 69));
+        assert!(list_shows_pr(&list, 169));
+        let fake = super::PickerRow {
+            pr_number: None,
+            display: "#16",
+            ..row
+        };
+        assert!(!list_shows_pr(&fake.to_line(), 16));
+    }
+
+    #[test]
+    fn fork_fast_path_requires_repository_provenance_and_exact_head() {
+        let root = std::env::temp_dir().join(format!("herdr-pr-identity-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "feature"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "base",
+        ]);
+        let head = git(&["rev-parse", "HEAD"]);
+        let mut target = crate::pr::PullRequestTarget {
+            number: 16,
+            head_ref: "feature".into(),
+            head_oid: head,
+            base_ref: "main".into(),
+            is_cross_repo: true,
+            head_repository: "fork/repo".into(),
+        };
+        assert!(
+            super::verify_pr_checkout_identity(&target, "feature", root.to_str().unwrap()).is_err()
+        );
+        git(&["config", "branch.feature.herdr-pr-repository", "other/repo"]);
+        assert!(
+            super::verify_pr_checkout_identity(&target, "feature", root.to_str().unwrap()).is_err()
+        );
+        git(&["config", "branch.feature.herdr-pr-repository", "fork/repo"]);
+        assert!(
+            super::verify_pr_checkout_identity(&target, "feature", root.to_str().unwrap()).is_ok()
+        );
+        target.head_oid = "different".into();
+        assert!(
+            super::verify_pr_checkout_identity(&target, "feature", root.to_str().unwrap()).is_err()
+        );
+        target.is_cross_repo = false;
+        assert!(
+            super::verify_pr_checkout_identity(&target, "feature", root.to_str().unwrap()).is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn fork_and_remote_checkout_helpers_use_rooted_relative_templates_and_preserve_identity() {
+        let root = std::env::temp_dir().join(format!("herdr-pr-checkout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("origin")).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let origin = root.join("origin");
+        let local = root.join("local");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&origin, &["init", "-q", "-b", "main"]);
+        git(&origin, &["commit", "--allow-empty", "-qm", "base"]);
+        git(&origin, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(origin.join("fork-file"), "fork code").unwrap();
+        git(&origin, &["add", "."]);
+        git(&origin, &["commit", "-qm", "fork"]);
+        let oid = git(&origin, &["rev-parse", "HEAD"]);
+        git(&origin, &["update-ref", "refs/pull/16/head", &oid]);
+        git(&origin, &["checkout", "-q", "main"]);
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                local.to_str().unwrap(),
+            ],
+        );
+        let config: crate::config::Config =
+            toml::from_str("worktree-path = '.worktrees/{{ branch }}'").unwrap();
+        let repo = local.to_str().unwrap();
+        let remote_path = config.render_worktree_path(
+            "remote-feature",
+            "remote-feature",
+            "origin/feature",
+            repo,
+            "user",
+        );
+        assert_eq!(
+            remote_path,
+            local.join(".worktrees/remote-feature").to_str().unwrap()
+        );
+        super::add_remote_tracking_worktree(repo, &remote_path, "remote-feature", "origin/feature")
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&remote_path).join("fork-file")).unwrap(),
+            "fork code"
+        );
+        let path = config.render_worktree_path("feature", "feature", "origin/main", repo, "user");
+        let target = crate::pr::PullRequestTarget {
+            number: 16,
+            head_ref: "feature".into(),
+            head_oid: oid.clone(),
+            base_ref: "main".into(),
+            is_cross_repo: true,
+            head_repository: "fork/repo".into(),
+        };
+        // Same-name existing branch must be rejected even at an identical OID.
+        git(&local, &["branch", "feature", &oid]);
+        assert!(super::checkout_fork_pr(&target, 16, &path, "feature", repo).is_err());
+        assert!(!std::path::Path::new(&path).exists());
+        git(&local, &["branch", "-D", "feature"]);
+        assert!(super::checkout_fork_pr(&target, 16, &path, "feature", repo).unwrap());
+        assert_eq!(
+            crate::pr::fork_repository(repo, "feature").as_deref(),
+            Some("fork/repo")
+        );
+        assert!(super::verify_pr_checkout_identity(&target, "feature", repo).is_ok());
+        assert_eq!(
+            git(std::path::Path::new(&path), &["rev-parse", "HEAD"]),
+            oid
+        );
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&path).join("fork-file")).unwrap(),
+            "fork code"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

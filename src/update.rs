@@ -86,7 +86,53 @@ pub enum Outcome {
         files: Vec<String>,
         /// Whether uncommitted work was stashed to get this far.
         stashed: bool,
+        operation: ConflictOperation,
     },
+}
+
+/// Actual Git state, not the configured strategy. Autostash restoration has
+/// no merge/rebase to continue, and must not pop the retained stash again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictOperation {
+    Merge,
+    Rebase,
+    Restoration,
+}
+
+fn conflict_operation(path: &str) -> ConflictOperation {
+    let exists = |name: &str| {
+        let p = git::git_stdout(&[
+            "-C",
+            path,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            name,
+        ]);
+        std::path::Path::new(p.trim()).exists()
+    };
+    if exists("rebase-merge") || exists("rebase-apply") {
+        ConflictOperation::Rebase
+    } else if exists("MERGE_HEAD") {
+        ConflictOperation::Merge
+    } else {
+        ConflictOperation::Restoration
+    }
+}
+
+fn conflict_prompt(
+    template: &str,
+    branch: &str,
+    base: &str,
+    operation: ConflictOperation,
+    files: &[String],
+    stashed: bool,
+) -> String {
+    match operation {
+        ConflictOperation::Merge => build_prompt(template, branch, base, Strategy::Merge, files, stashed),
+        ConflictOperation::Rebase => build_prompt(template, branch, base, Strategy::Rebase, files, stashed),
+        ConflictOperation::Restoration => format!("Resolve the unmerged working-tree changes in {} on `{branch}` after updating from `{base}`. No merge or rebase is active: do not run merge/rebase --continue. Keep both sides' intent and stage resolved files; leave the restored work uncommitted. Git may have retained an autostash: do not pop, apply or drop it again; preserve it until the restored work is verified. Do not push or change unrelated files.", describe_files(files)),
+    }
 }
 
 /// The paths git has left unmerged in `path`.
@@ -118,6 +164,7 @@ pub fn bring_in(path: &str, base: &str, strategy: Strategy) -> Result<Outcome> {
         return Ok(Outcome::Conflicted {
             files: pending,
             stashed: false,
+            operation: conflict_operation(path),
         });
     }
     if git::git_success(&["-C", path, "merge-base", "--is-ancestor", base, "HEAD"]) {
@@ -129,13 +176,16 @@ pub fn bring_in(path: &str, base: &str, strategy: Strategy) -> Result<Outcome> {
     args.extend(strategy.args(base));
     let output =
         git::git_output(&args).with_context(|| format!("running git {}", strategy.as_str()))?;
-    if output.status.success() {
-        return Ok(Outcome::Updated);
-    }
-
     let files = conflicted_files(path);
     if !files.is_empty() {
-        return Ok(Outcome::Conflicted { files, stashed });
+        return Ok(Outcome::Conflicted {
+            files,
+            stashed,
+            operation: conflict_operation(path),
+        });
+    }
+    if output.status.success() {
+        return Ok(Outcome::Updated);
     }
     // Not a conflict: git refused for some other reason and left nothing to
     // resolve, so its own message is the only useful thing to pass on.
@@ -248,12 +298,16 @@ pub fn update_worktree(
                 "done",
             );
         }
-        Outcome::Conflicted { files, stashed } => {
-            let prompt = build_prompt(
+        Outcome::Conflicted {
+            files,
+            stashed,
+            operation,
+        } => {
+            let prompt = conflict_prompt(
                 config.update_prompt(),
                 branch,
                 base,
-                strategy,
+                *operation,
                 files,
                 *stashed,
             );
@@ -584,6 +638,7 @@ codex = ["--dangerously-bypass-approvals-and-sandbox"]
             Outcome::Conflicted {
                 files: vec!["f".to_string()],
                 stashed: false,
+                operation: ConflictOperation::Merge,
             }
         );
         // A checkout already stopped on a conflict reports it rather than
@@ -614,7 +669,71 @@ codex = ["--dangerously-bypass-approvals-and-sandbox"]
             Outcome::Conflicted {
                 files: vec!["f".to_string()],
                 stashed: true,
+                operation: ConflictOperation::Merge,
             }
         );
+    }
+    #[test]
+    fn successful_merge_and_rebase_autostash_conflicts_are_restoration_not_updated() {
+        for strategy in [Strategy::Merge, Strategy::Rebase] {
+            let repo = repo_with_topic(&format!("restore-{}", strategy.as_str()));
+            git(&repo, &["checkout", "-q", "main"]);
+            std::fs::write(repo.join("f"), "upstream\n").unwrap();
+            git(&repo, &["commit", "-qam", "upstream"]);
+            git(&repo, &["checkout", "-q", "topic"]);
+            std::fs::write(repo.join("f"), "dirty\n").unwrap();
+            let outcome = bring_in(repo.to_str().unwrap(), "main", strategy).unwrap();
+            assert_eq!(
+                outcome,
+                Outcome::Conflicted {
+                    files: vec!["f".into()],
+                    stashed: true,
+                    operation: ConflictOperation::Restoration
+                }
+            );
+            assert!(!git(&repo, &["stash", "list"]).is_empty());
+            let prompt = conflict_prompt(
+                DEFAULT_PROMPT,
+                "topic",
+                "main",
+                ConflictOperation::Restoration,
+                &["f".into()],
+                true,
+            );
+            assert!(!prompt.contains("git merge --continue"));
+            assert!(!prompt.contains("git rebase --continue"));
+            assert!(prompt.contains("do not pop, apply or drop"));
+            std::fs::remove_dir_all(repo).unwrap();
+        }
+    }
+
+    #[test]
+    fn pending_rebase_uses_rebase_recovery_even_when_merge_is_configured() {
+        let repo = repo_with_topic("actual-rebase");
+        std::fs::write(repo.join("f"), "topic\n").unwrap();
+        git(&repo, &["commit", "-qam", "topic"]);
+        git(&repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("f"), "main\n").unwrap();
+        git(&repo, &["commit", "-qam", "main"]);
+        git(&repo, &["checkout", "-q", "topic"]);
+        bring_in(repo.to_str().unwrap(), "main", Strategy::Rebase).unwrap();
+        assert!(matches!(
+            bring_in(repo.to_str().unwrap(), "main", Strategy::Merge).unwrap(),
+            Outcome::Conflicted {
+                operation: ConflictOperation::Rebase,
+                ..
+            }
+        ));
+        let prompt = conflict_prompt(
+            DEFAULT_PROMPT,
+            "topic",
+            "main",
+            ConflictOperation::Rebase,
+            &["f".into()],
+            false,
+        );
+        assert!(prompt.contains("git rebase --continue"));
+        assert!(!prompt.contains("git merge --continue"));
+        std::fs::remove_dir_all(repo).unwrap();
     }
 }

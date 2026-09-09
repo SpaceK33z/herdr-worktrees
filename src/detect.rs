@@ -105,9 +105,46 @@ impl RepoCtx {
 
     /// Does `key` (from someone else's `[projects."…"]` table) name this repo?
     pub fn matches(&self, key: &str) -> bool {
-        let key = normalize_key(key);
-        self.keys.iter().any(|k| normalize_key(k) == key)
+        if Path::new(key).is_absolute() {
+            // Existing paths are decided exclusively by filesystem identity:
+            // lexical `symlink/..` reduction can name a different repository.
+            // For unavailable paths, retain `..` rather than guessing its meaning.
+            return same_filesystem_entry(Path::new(key), Path::new(&self.repo))
+                .unwrap_or_else(|| Path::new(key) == Path::new(&self.repo));
+        }
+        // Bare directory names are filesystem keys too, unless they identify
+        // an actual configured remote. Remote names have their own rules.
+        let remote_keys = [
+            format!("{}/{}/{}", self.host, self.owner, self.name),
+            format!("{}/{}", self.owner, self.name),
+            self.name.clone(),
+        ];
+        if !self.name.is_empty()
+            && remote_keys
+                .iter()
+                .any(|remote| normalize_key(remote) == normalize_key(key))
+        {
+            return true;
+        }
+        if key == self.repo_name {
+            return true;
+        }
+        if !key.contains('/') {
+            if let Some(parent) = Path::new(&self.repo).parent() {
+                return same_filesystem_entry(&parent.join(key), Path::new(&self.repo))
+                    .unwrap_or(false);
+            }
+        }
+        false
     }
+}
+
+fn same_filesystem_entry(a: &Path, b: &Path) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(a)
+        .ok()
+        .zip(std::fs::metadata(b).ok())
+        .map(|(a, b)| a.dev() == b.dev() && a.ino() == b.ino())
 }
 
 /// One convention for declaring where worktrees live.
@@ -348,10 +385,7 @@ impl Source for Ccmanager {
         let file = config_home().join("ccmanager/config.json");
         let json = read_json(&file)?;
         let pattern = find_branch_pattern(&json, 0)?;
-        let value = pattern.replace("{branch}", "{{ branch | sanitize }}");
-        if value.contains('{') && !value.contains("{{") {
-            return None; // some other placeholder we cannot render
-        }
+        let value = ccmanager_template(&pattern)?;
         let value = expand_tilde(&value);
         let value = if is_absolute(&value) {
             value
@@ -365,6 +399,14 @@ impl Source for Ccmanager {
             value,
         ))
     }
+}
+
+fn ccmanager_template(pattern: &str) -> Option<String> {
+    let remainder = pattern.replace("{branch}", "");
+    if remainder.contains(['{', '}']) {
+        return None;
+    }
+    Some(pattern.replace("{branch}", "{{ branch | sanitize }}"))
 }
 
 /// The repo itself: infer the layout from the worktrees that already exist.
@@ -651,7 +693,7 @@ fn normalize_key(key: &str) -> String {
 }
 
 /// Split a remote URL into (host, owner, name), for scp-style and URL forms.
-fn parse_remote(url: &str) -> (String, String, String) {
+pub(crate) fn parse_remote(url: &str) -> (String, String, String) {
     let url = url.trim();
     if url.is_empty() {
         return (String::new(), String::new(), String::new());
@@ -848,5 +890,54 @@ mod tests {
             generalize("/home/dev/app/.worktrees/fix", "kees/fix").as_deref(),
             Some("/home/dev/app/.worktrees/{{ branch_short }}")
         );
+    }
+    #[test]
+    fn ccmanager_rejects_every_unrecognized_placeholder() {
+        assert_eq!(
+            ccmanager_template("../{branch}"),
+            Some("../{{ branch | sanitize }}".into())
+        );
+        for pattern in [
+            "../{repo}/{branch}",
+            "../{{branch}}",
+            "../{branch}/{user}",
+            "../{branch}/}",
+        ] {
+            assert_eq!(ccmanager_template(pattern), None, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn filesystem_project_keys_resolve_symlink_parent_before_matching() {
+        let root = std::env::temp_dir().join(format!("herdr-symlink-key-{}", std::process::id()));
+        let current = root.join("A/repo");
+        let other = root.join("B/repo");
+        std::fs::create_dir_all(&current).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(root.join("B/child")).unwrap();
+        std::os::unix::fs::symlink(root.join("B/child"), root.join("A/link")).unwrap();
+        let key = root.join("A/link/../repo");
+        let ctx = RepoCtx::new(current.to_str().unwrap());
+        assert!(!ctx.matches(key.to_str().unwrap()));
+        assert!(RepoCtx::new(other.to_str().unwrap()).matches(key.to_str().unwrap()));
+        std::os::unix::fs::symlink(&current, root.join("alias")).unwrap();
+        assert!(ctx.matches(root.join("alias").to_str().unwrap()));
+        // Missing components do not license lexical parent reduction either.
+        assert!(!ctx.matches(root.join("A/missing/../repo").to_str().unwrap()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_project_keys_do_not_lowercase_paths() {
+        let root = std::env::temp_dir().join(format!("herdr-case-key-{}", std::process::id()));
+        let upper = root.join("CaseRepo");
+        let lower = root.join("caserepo");
+        std::fs::create_dir_all(&upper).unwrap();
+        let ctx = RepoCtx::new(upper.to_str().unwrap());
+        assert!(ctx.matches(upper.to_str().unwrap()));
+        // On a case-insensitive filesystem both paths legitimately identify
+        // the same directory; on Linux they must not match.
+        assert_eq!(ctx.matches(lower.to_str().unwrap()), lower.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

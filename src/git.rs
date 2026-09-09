@@ -137,7 +137,11 @@ pub enum FetchBase {
 
 /// The commit hash a ref points to, if the ref exists.
 pub fn ref_oid(repo: &str, refname: &str) -> Option<String> {
-    let oid = git_stdout(&["-C", repo, "rev-parse", "-q", "--verify", refname]);
+    let output = git_output(&["-C", repo, "rev-parse", "-q", "--verify", refname]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let oid = String::from_utf8_lossy(&output.stdout);
     let oid = oid.trim();
     (!oid.is_empty()).then(|| oid.to_string())
 }

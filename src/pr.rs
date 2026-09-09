@@ -44,6 +44,7 @@ pub struct PullRequestTarget {
     pub head_oid: String,
     pub base_ref: String,
     pub is_cross_repo: bool,
+    pub head_repository: String,
 }
 
 /// Timeouts per `gh` invocation. The explicit PR lookup is a user action and
@@ -111,6 +112,14 @@ fn gh_output(
         std::process::Stdio::null()
     };
     let mut command = std::process::Command::new("gh");
+    // Do not let gh's separately configured default remote change PR identity.
+    let ctx = crate::detect::RepoCtx::new(repo);
+    if !ctx.host.is_empty() && !ctx.owner.is_empty() && !ctx.name.is_empty() {
+        command.env(
+            "GH_REPO",
+            format!("{}/{}/{}", ctx.host, ctx.owner, ctx.name),
+        );
+    }
     command
         .args(args)
         .current_dir(repo)
@@ -192,7 +201,7 @@ fn first_line(stderr: &[u8]) -> String {
 /// action, so it gets a longer timeout than the background picker cache and
 /// captures stderr for diagnostics.
 pub fn resolve_pr_detailed(number: u32, repo: &str) -> Result<PullRequestTarget, String> {
-    let fields = "number,headRefName,headRefOid,baseRefName,isCrossRepository";
+    let fields = "number,headRefName,headRefOid,baseRefName,isCrossRepository,headRepository";
     let number = number.to_string();
     let json = gh_output(
         repo,
@@ -211,7 +220,12 @@ fn parse_pr_target(json: &str) -> Option<PullRequestTarget> {
         head_ref: value.get("headRefName")?.as_str()?.to_string(),
         head_oid: value.get("headRefOid")?.as_str()?.to_string(),
         base_ref: value.get("baseRefName")?.as_str()?.to_string(),
-        is_cross_repo: value.get("isCrossRepository")?.as_bool().unwrap_or(false),
+        is_cross_repo: value.get("isCrossRepository")?.as_bool()?,
+        head_repository: value
+            .get("headRepository")?
+            .get("nameWithOwner")?
+            .as_str()?
+            .to_string(),
     })
 }
 
@@ -224,11 +238,11 @@ const CACHE_TTL_MS: u128 = 60_000;
 const LISTINGS: [(&str, &str); 2] = [
     (
         "open",
-        "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid",
+        "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid,isCrossRepository,headRepository",
     ),
     (
         "merged",
-        "id,number,url,state,isDraft,reviewDecision,headRefName,headRefOid",
+        "id,number,url,state,isDraft,reviewDecision,headRefName,headRefOid,isCrossRepository,headRepository",
     ),
 ];
 /// One page per listing. Paging is what costs time here: a busy repository
@@ -240,7 +254,7 @@ const LISTING_LIMIT: usize = 100;
 /// Fields for a per-branch query. Only a handful of rows come back, so the
 /// expensive `mergeStateStatus` is affordable here.
 const BRANCH_FIELDS: &str =
-    "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid";
+    "id,number,url,state,isDraft,reviewDecision,mergeStateStatus,headRefName,headRefOid,isCrossRepository,headRepository";
 /// Pull requests fetched per branch. Only the newest open one, or a merged one
 /// that still covers the branch head, is ever shown; a handful of rows is more
 /// than enough history to choose from.
@@ -261,7 +275,8 @@ const REFRESH_FILE: &str = "last-refresh.json";
 type BranchHead = (String, String);
 
 /// Fetch the pull request for each requested branch. Branches already in the
-/// cache start no process at all.
+/// cache avoid network requests; local Git config still validates repository
+/// provenance so rebinding a branch cannot reuse another repository's PR.
 ///
 /// Two shallow repository-wide listings answer most branches in one round trip
 /// each; whatever they miss — an older merged pull request, typically, which is
@@ -295,7 +310,7 @@ pub fn fetch_many(
     }
 
     let (rows, mut failed) = fetch_listings(repo, patience);
-    let mut fresh = resolve_from_listings(&rows, &wanted);
+    let mut fresh = resolve_from_listings(&rows, &wanted, repo);
 
     let unresolved: Vec<&BranchHead> = wanted
         .iter()
@@ -373,6 +388,7 @@ fn fetch_listings(repo: &str, patience: FetchPatience) -> (Vec<serde_json::Value
 fn resolve_from_listings(
     rows: &[serde_json::Value],
     wanted: &[&BranchHead],
+    repo: &str,
 ) -> HashMap<String, PrInfo> {
     let mut by_branch: HashMap<&str, Vec<&serde_json::Value>> = HashMap::new();
     for row in rows {
@@ -384,7 +400,10 @@ fn resolve_from_listings(
         .iter()
         .filter_map(|(branch, head)| {
             let candidates = by_branch.get(branch.as_str())?;
-            Some((branch.clone(), select_pr_candidate(candidates, head)?))
+            Some((
+                branch.clone(),
+                select_pr_candidate(candidates, head, fork_repository(repo, branch).as_deref())?,
+            ))
         })
         .collect()
 }
@@ -393,13 +412,22 @@ fn resolve_from_listings(
 /// branch has no pull request" is an answer, not a failure: it comes back as a
 /// default `PrInfo` so the cache stops asking again.
 fn fetch_branch(repo: &str, branch: &str, head: &str, patience: FetchPatience) -> Option<PrInfo> {
-    parse_branch_prs(&gh_fetch_branch(repo, branch, patience)?, head)
+    parse_branch_prs_for(
+        &gh_fetch_branch(repo, branch, patience)?,
+        head,
+        fork_repository(repo, branch).as_deref(),
+    )
 }
 
+#[cfg(test)]
 fn parse_branch_prs(json: &str, head: &str) -> Option<PrInfo> {
+    parse_branch_prs_for(json, head, None)
+}
+
+fn parse_branch_prs_for(json: &str, head: &str, repository: Option<&str>) -> Option<PrInfo> {
     let value: serde_json::Value = serde_json::from_str(json).ok()?;
     let prs: Vec<_> = value.as_array()?.iter().collect();
-    Some(select_pr_candidate(&prs, head).unwrap_or_default())
+    Some(select_pr_candidate(&prs, head, repository).unwrap_or_default())
 }
 
 /// Every pull request ever opened from `branch`, newest first.
@@ -500,7 +528,62 @@ fn parse_thread_counts(json: &str) -> Option<HashMap<String, ThreadCount>> {
     Some(counts)
 }
 
-fn select_pr_candidate(prs: &[&serde_json::Value], current_head: &str) -> Option<PrInfo> {
+/// Explicit fork checkout provenance, or the identity of a non-origin
+/// tracking remote. An untracked local branch belongs to the origin context;
+/// unpublished commits do not change that repository identity.
+pub(crate) fn fork_repository(repo: &str, branch: &str) -> Option<String> {
+    let config = |key: &str| {
+        crate::git::git_stdout(&["-C", repo, "config", "--get", key])
+            .trim()
+            .to_string()
+    };
+    let recorded = config(&format!("branch.{branch}.herdr-pr-repository"));
+    if !recorded.is_empty() {
+        return Some(recorded);
+    }
+    let remote = config(&format!("branch.{branch}.remote"));
+    if remote.is_empty() || remote == "origin" || remote == "." {
+        return None;
+    }
+    let origin = crate::detect::parse_remote(&config("remote.origin.url"));
+    let other = crate::detect::parse_remote(&config(&format!("remote.{remote}.url")));
+    if other.0.eq_ignore_ascii_case(&origin.0)
+        && other.1.eq_ignore_ascii_case(&origin.1)
+        && other.2.eq_ignore_ascii_case(&origin.2)
+    {
+        return None;
+    }
+    if other.0.eq_ignore_ascii_case(&origin.0) && !other.1.is_empty() && !other.2.is_empty() {
+        Some(format!("{}/{}", other.1, other.2))
+    } else {
+        // Unknown/non-GitHub tracking identity must not receive origin's PR.
+        Some(format!("unknown-remote:{remote}"))
+    }
+}
+
+fn select_pr_candidate(
+    prs: &[&serde_json::Value],
+    current_head: &str,
+    repository: Option<&str>,
+) -> Option<PrInfo> {
+    let prs: Vec<_> = prs
+        .iter()
+        .copied()
+        .filter(|pr| {
+            match (
+                pr.get("isCrossRepository").and_then(|v| v.as_bool()),
+                repository,
+            ) {
+                (Some(false), None) => true,
+                (Some(true), Some(expected)) => pr
+                    .get("headRepository")
+                    .and_then(|v| v.get("nameWithOwner"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(expected)),
+                _ => false,
+            }
+        })
+        .collect();
     // An open PR is actionable. Otherwise retain a merged PR only when it
     // covers the branch's current head; later local commits must not inherit a
     // stale `merged` label from an older PR.
@@ -661,7 +744,11 @@ fn cache_store(state_dir: &Path, repo: &str, branch: &str, info: &PrInfo) {
 }
 
 fn cache_file(state_dir: &Path, repo: &str, branch: &str) -> PathBuf {
-    repo_cache_dir(state_dir, repo).join(format!("{:016x}.json", cache_hash(branch)))
+    let identity = fork_repository(repo, branch).unwrap_or_default();
+    repo_cache_dir(state_dir, repo).join(format!(
+        "{:016x}.json",
+        cache_hash(&format!("{branch}\0{identity}"))
+    ))
 }
 
 fn refresh_file(state_dir: &Path, repo: &str) -> PathBuf {
@@ -670,7 +757,7 @@ fn refresh_file(state_dir: &Path, repo: &str) -> PathBuf {
 
 fn repo_cache_dir(state_dir: &Path, repo: &str) -> PathBuf {
     state_dir
-        .join("pr-info-v2")
+        .join("pr-info-v3")
         .join(format!("{:016x}", cache_hash(repo)))
 }
 
@@ -718,7 +805,8 @@ mod tests {
             "headRefName": "kees/fix",
             "headRefOid": "abc123",
             "baseRefName": "main",
-            "isCrossRepository": true
+            "isCrossRepository": true,
+            "headRepository": {"nameWithOwner": "fork/repo"}
         }"#;
         let target = parse_pr_target(json).unwrap();
         assert_eq!(target.number, 42);
@@ -737,8 +825,8 @@ mod tests {
     #[test]
     fn open_pr_takes_precedence_over_merged_history() {
         let json = r#"[
-            {"number":1,"state":"MERGED","headRefOid":"head","mergeStateStatus":"CLEAN"},
-            {"number":2,"state":"OPEN","headRefOid":"head","mergeStateStatus":"DIRTY"}
+            {"number":1,"isCrossRepository":false,"state":"MERGED","headRefOid":"head","mergeStateStatus":"CLEAN"},
+            {"number":2,"isCrossRepository":false,"state":"OPEN","headRefOid":"head","mergeStateStatus":"DIRTY"}
         ]"#;
         let pr = parse_branch_prs(json, "head").unwrap();
         assert_eq!(pr.number, Some(2));
@@ -749,7 +837,7 @@ mod tests {
     #[test]
     fn merged_pr_only_applies_to_the_current_head() {
         let json = r#"[
-            {"number":1,"state":"MERGED","headRefOid":"merged-head","mergeStateStatus":"CLEAN"}
+            {"number":1,"isCrossRepository":false,"state":"MERGED","headRefOid":"merged-head","mergeStateStatus":"CLEAN"}
         ]"#;
         let merged = parse_branch_prs(json, "merged-head").unwrap();
         assert_eq!(merged.number, Some(1));
@@ -766,7 +854,7 @@ mod tests {
     #[test]
     fn a_branch_query_reports_a_merged_pull_request() {
         let json = r#"[
-            {"number":16071,"state":"MERGED","headRefName":"kees/fix","headRefOid":"head"}
+            {"number":16071,"isCrossRepository":false,"state":"MERGED","headRefName":"kees/fix","headRefOid":"head"}
         ]"#;
         let pr = parse_branch_prs(json, "head").unwrap();
         assert_eq!(pr.number, Some(16071));
@@ -789,9 +877,9 @@ mod tests {
     fn listings_are_grouped_by_branch() {
         let rows: Vec<serde_json::Value> = serde_json::from_str(
             r#"[
-            {"number":1,"state":"OPEN","headRefName":"one","headRefOid":"one-head"},
-            {"number":2,"state":"MERGED","headRefName":"two","headRefOid":"two-head"},
-            {"number":3,"state":"OPEN","headRefName":"other","headRefOid":"other-head"}
+            {"number":1,"isCrossRepository":false,"state":"OPEN","headRefName":"one","headRefOid":"one-head"},
+            {"number":2,"isCrossRepository":false,"state":"MERGED","headRefName":"two","headRefOid":"two-head"},
+            {"number":3,"isCrossRepository":false,"state":"OPEN","headRefName":"other","headRefOid":"other-head"}
         ]"#,
         )
         .unwrap();
@@ -801,7 +889,7 @@ mod tests {
             ("none".to_string(), "none-head".to_string()),
         ];
         let wanted: Vec<_> = branches.iter().collect();
-        let prs = resolve_from_listings(&rows, &wanted);
+        let prs = resolve_from_listings(&rows, &wanted, "");
         assert_eq!(prs["one"].number, Some(1));
         assert_eq!(prs["two"].number, Some(2));
         assert!(prs["two"].merged);
@@ -1075,5 +1163,32 @@ mod tests {
             cache_file(state, "/repo/one", "feature/foo"),
             cache_file(state, "/repo/one", "feature-foo")
         );
+    }
+    #[test]
+    fn pr_metadata_matches_repository_identity_not_just_head_name() {
+        let rows: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"number": 1, "state": "OPEN", "headRefName": "feature", "headRefOid": "fork-head", "isCrossRepository": true, "headRepository": {"nameWithOwner": "fork/repo"}},
+            {"number": 2, "state": "OPEN", "headRefName": "feature", "headRefOid": "remote-head", "isCrossRepository": false, "headRepository": {"nameWithOwner": "origin/repo"}}
+        ])).unwrap();
+        let candidates: Vec<_> = rows.iter().collect();
+        // Same-repo unpublished commits still receive their open PR metadata.
+        assert_eq!(
+            super::select_pr_candidate(&candidates, "local-unpublished", None)
+                .unwrap()
+                .number,
+            Some(2)
+        );
+        assert_eq!(
+            super::select_pr_candidate(&candidates, "fork-head", Some("fork/repo"))
+                .unwrap()
+                .number,
+            Some(1)
+        );
+        assert!(
+            super::select_pr_candidate(&candidates, "fork-head", Some("unrelated/repo")).is_none()
+        );
+        assert!(super::select_pr_candidate(&[&rows[0]], "fork-head", None).is_none());
+        let unknown = serde_json::json!({"number":3, "state":"OPEN"});
+        assert!(super::select_pr_candidate(&[&unknown], "head", None).is_none());
     }
 }

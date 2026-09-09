@@ -151,6 +151,16 @@ const USAGE: &str = concat!(
 
 /// The `create` entry point: one argument naming the branch, plus flags.
 pub fn run_cli(args: &[String]) -> Result<()> {
+    let result = run_cli_inner(args);
+    if let Err(error) = &result {
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", serde_json::json!({"error": format!("{error:#}")}));
+        }
+    }
+    result
+}
+
+fn run_cli_inner(args: &[String]) -> Result<()> {
     let mut name: Option<String> = None;
     let mut base: Option<String> = None;
     let mut exact = false;
@@ -174,7 +184,11 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             "--no-setup" => no_setup = true,
             "--no-open" => no_open = true,
             "--help" | "-h" => {
-                println!("{USAGE}");
+                if args.iter().any(|arg| arg == "--json") {
+                    println!("{}", serde_json::json!({"help": USAGE}));
+                } else {
+                    println!("{USAGE}");
+                }
                 return Ok(());
             }
             other if other.starts_with('-') && other != "-" => {
@@ -206,7 +220,7 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         herdr::attach_checkout(config.open_mode(), &repo, &created.path, &created.branch)
     };
 
-    let setup_summary = if no_setup || !setup::has_work(&repo, &config) {
+    let prepared = if no_setup || !setup::has_work(&repo, &config) {
         None
     } else {
         let prepared = setup::run_setup(
@@ -223,8 +237,9 @@ pub fn run_cli(args: &[String]) -> Result<()> {
                 created.path
             );
         }
-        Some(prepared.summary())
+        Some(prepared)
     };
+    let setup_summary = prepared.as_ref().map(|value| value.summary());
 
     if json {
         println!(
@@ -235,6 +250,8 @@ pub fn run_cli(args: &[String]) -> Result<()> {
                 "base": util::strip_remote(&created.base),
                 "action": created.action(),
                 "setup": setup_summary,
+                "includes": prepared.as_ref().map(|value| &value.copy),
+                "scriptSucceeded": prepared.as_ref().and_then(|value| value.script_ok),
                 // Legacy key, corrected to identify the destination, not the source.
                 "workspace": attached.as_ref().map(|value| &value.workspace_id),
                 "attachedWorkspaceId": attached.as_ref().map(|value| &value.workspace_id),

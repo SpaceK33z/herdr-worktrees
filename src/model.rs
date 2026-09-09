@@ -768,6 +768,7 @@ fn push_fzf_row(
         entry_kind,
         sync_kind: wt.sync_kind.as_str(),
         changes: &wt.changes,
+        pr_number: wt.pr_number,
         display: &display,
     }
     .write_line(out);

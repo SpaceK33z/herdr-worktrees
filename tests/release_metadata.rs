@@ -59,3 +59,43 @@ fn plugin_declares_release_metadata() {
     assert!(root.join("README.md").is_file());
     assert!(root.join("LICENSE").is_file());
 }
+
+#[test]
+fn release_script_checks_values_and_rejects_mismatches() {
+    let root = project_root();
+    let script = root.join("scripts/check-release-versions.sh");
+    let version = env!("CARGO_PKG_VERSION");
+    let check = |dir: &std::path::Path, tag: &str| {
+        std::process::Command::new("sh")
+            .arg(&script)
+            .arg(tag)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    };
+    assert!(check(&root, &format!("v{version}")));
+    assert!(!check(&root, "v999.0.0"));
+    let fixture = std::env::temp_dir().join(format!("herdr-release-check-{}", std::process::id()));
+    fs::create_dir_all(&fixture).unwrap();
+    fs::write(
+        fixture.join("Cargo.toml"),
+        "[package]\nversion = \"1.2.3\"\n",
+    )
+    .unwrap();
+    fs::write(fixture.join("herdr-plugin.toml"), "version = \"1.2.3\"\n").unwrap();
+    assert!(check(&fixture, "v1.2.3"));
+    fs::write(fixture.join("herdr-plugin.toml"), "version = \"1.2.4\"\n").unwrap();
+    assert!(!check(&fixture, "v1.2.3"));
+    fs::write(fixture.join("herdr-plugin.toml"), "").unwrap();
+    assert!(!check(&fixture, "v1.2.3"));
+    fs::remove_dir_all(fixture).unwrap();
+    let workflow = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
+    assert!(
+        workflow
+            .find("sh scripts/check-release-versions.sh")
+            .unwrap()
+            < workflow.find("googleapis/release-please-action").unwrap()
+    );
+}

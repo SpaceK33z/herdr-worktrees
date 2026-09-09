@@ -25,6 +25,9 @@ jobs:
       sha: ${{ steps.release.outputs.sha }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      - uses: actions/checkout@v4
+      - name: Verify metadata before publication
+        run: sh scripts/check-release-versions.sh
       - uses: googleapis/release-please-action@v4
         id: release
         with:
@@ -50,18 +53,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Verify versions match the tag
         shell: bash
-        run: |
-          package_version=$(awk '
-            /^\[package\]$/ { in_package = 1; next }
-            /^\[/ { in_package = 0 }
-            in_package && /^version = / { gsub(/["[:space:]]/, "", $3); print $3; exit }
-          ' Cargo.toml)
-          plugin_version=$(awk '/^version = /{gsub(/["[:space:]]/, "", $3); print; exit}' herdr-plugin.toml)
-          test "v$package_version" = "${{ needs.release-please.outputs.tag_name }}"
-          test "$package_version" = "$plugin_version" || {
-            echo "Cargo.toml ($package_version) and herdr-plugin.toml ($plugin_version) disagree" >&2
-            exit 1
-          }
+        run: sh scripts/check-release-versions.sh "${{ needs.release-please.outputs.tag_name }}"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo test --locked

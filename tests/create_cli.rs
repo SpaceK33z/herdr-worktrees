@@ -210,3 +210,140 @@ fn assert_no_attachment(result: &Value) {
         assert_eq!(result.get(key), Some(&Value::Null), "{key}: {result}");
     }
 }
+
+fn fixture_git(f: &Fixture, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(f.dir.join("repo"))
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{args:?}: {out:?}");
+}
+
+#[test]
+fn json_stdout_with_copied_skipped_includes_script_and_relative_destination_is_one_document() {
+    let f = Fixture::new("workspace");
+    let repo = f.dir.join("repo");
+    fixture_git(&f, &["checkout", "-q", "-b", "with-existing"]);
+    std::fs::write(repo.join(".existing"), "from checkout").unwrap();
+    fixture_git(&f, &["add", ".existing"]);
+    fixture_git(&f, &["commit", "-qm", "existing"]);
+    fixture_git(&f, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join(".gitignore"), ".env\n.existing\n.worktrees/\n").unwrap();
+    std::fs::write(repo.join(".worktreeinclude"), ".env\n.existing\n").unwrap();
+    std::fs::write(repo.join(".env"), "dummy secret").unwrap();
+    std::fs::write(repo.join(".existing"), "must not overwrite").unwrap();
+    std::fs::create_dir(repo.join("subdir")).unwrap();
+    std::fs::write(f.dir.join("config/config.toml"), r#"
+auto-detect = false
+fetch-before-create = false
+worktree-path = '.worktrees/{{ branch }}'
+[pre-start]
+setup-worktree = 'echo script-output; test "$PWD" = "$WORKTREE_PATH"; cat .env; printf "%s" "$WORKTREE_PATH" > prepared-at'
+"#).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-worktrees"))
+        .current_dir(repo.join("subdir"))
+        .env("HERDR_PLUGIN_CONFIG_DIR", f.dir.join("config"))
+        .env("HERDR_BIN_PATH", "/bin/true")
+        .args([
+            "create",
+            "topic",
+            "--base",
+            "with-existing",
+            "--exact",
+            "--json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let dest = repo.join(".worktrees/topic");
+    assert_eq!(json["path"], dest.to_str().unwrap());
+    assert_eq!(json["includes"]["copied"], serde_json::json!([".env"]));
+    assert_eq!(
+        json["includes"]["skipped"],
+        serde_json::json!([".existing"])
+    );
+    assert_eq!(json["scriptSucceeded"], true);
+    assert_eq!(
+        std::fs::read_to_string(dest.join(".existing")).unwrap(),
+        "from checkout"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest.join("prepared-at")).unwrap(),
+        dest.to_str().unwrap()
+    );
+    assert!(!repo.join("subdir/.worktrees").exists());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for text in [
+        "include: copied .env",
+        "include: skipped .existing",
+        "script-output",
+        "dummy secret",
+    ] {
+        assert!(stderr.contains(text), "{out:?}");
+    }
+}
+
+#[test]
+fn json_include_failure_is_one_error_document_and_external_directory_stays_empty() {
+    let f = Fixture::new("workspace");
+    let repo = f.dir.join("repo");
+    let outside = f.dir.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    fixture_git(&f, &["checkout", "-q", "-b", "symlink-base"]);
+    std::os::unix::fs::symlink(&outside, repo.join("config")).unwrap();
+    fixture_git(&f, &["add", "config"]);
+    fixture_git(&f, &["commit", "-qm", "symlink"]);
+    fixture_git(&f, &["checkout", "-q", "main"]);
+    std::fs::create_dir(repo.join("config")).unwrap();
+    std::fs::write(repo.join("config/secret"), "dummy secret").unwrap();
+    std::fs::write(repo.join(".gitignore"), "config/secret\n").unwrap();
+    std::fs::write(repo.join(".worktreeinclude"), "config/secret\n").unwrap();
+    std::fs::write(
+        f.dir.join("config/config.toml"),
+        "auto-detect = false\nfetch-before-create = false\nworktree-path = '../{{ branch }}'\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr-worktrees"))
+        .current_dir(&repo)
+        .env("HERDR_PLUGIN_CONFIG_DIR", f.dir.join("config"))
+        .env("HERDR_BIN_PATH", "/bin/true")
+        .args([
+            "create",
+            "topic",
+            "--base",
+            "symlink-base",
+            "--json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("failed to copy"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("include: failed"));
+    assert_eq!(std::fs::read_dir(outside).unwrap().count(), 0);
+}
+
+#[test]
+fn json_help_and_argument_errors_are_also_single_documents() {
+    for args in [
+        vec!["create", "--json", "--help"],
+        vec!["create", "--json", "--bogus"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_herdr-worktrees"))
+            .env("HERDR_BIN_PATH", "/bin/true")
+            .args(args)
+            .output()
+            .unwrap();
+        let json: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(json["help"].is_string() || json["error"].is_string());
+    }
+}

@@ -230,12 +230,12 @@ impl Config {
         self.worktree_include.unwrap_or(true)
     }
 
-    /// Delete the branch when its worktree is removed. Defaults to true: a
+    /// Delete the branch when explicitly enabled (default: false). A
     /// branch is only auto-deleted when its content is provably on the base
     /// branch (pushed, or landed via squash merge/rebase), and a branch still
     /// checked out in another worktree is never deleted.
     pub fn delete_branch(&self) -> bool {
-        self.remove.delete_branch.unwrap_or(true)
+        self.remove.delete_branch.unwrap_or(false)
     }
 
     pub fn force(&self) -> bool {
@@ -339,7 +339,8 @@ impl Config {
         );
         // Templates commonly point at a sibling directory ("{{ repo_path }}/../"),
         // but git records the resolved path, so collapse it before we compare.
-        util::normalize_path(&rendered)
+        let absolute = Path::new(repo_path).join(rendered);
+        util::normalize_path(&absolute.to_string_lossy())
     }
 }
 
@@ -498,6 +499,19 @@ worktree-path = "{{ repo_path }}/../{{ repo_name }}.{{ branch | sanitize }}"
         assert_eq!(
             config.render_worktree_path("kees/fix", "fix", "main", "/home/dev/app", "kees"),
             "/home/dev/app.kees-fix"
+        );
+    }
+    #[test]
+    fn branch_deletion_is_opt_in_and_relative_destinations_are_rooted() {
+        assert!(!Config::default().delete_branch());
+        let config: Config = toml::from_str(
+            "worktree-path = '.worktrees/{{ branch }}'\n[remove]\ndelete-branch = true",
+        )
+        .unwrap();
+        assert!(config.delete_branch());
+        assert_eq!(
+            config.render_worktree_path("topic", "topic", "main", "/repo", "user"),
+            "/repo/.worktrees/topic"
         );
     }
 }
