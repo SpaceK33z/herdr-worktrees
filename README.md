@@ -71,7 +71,7 @@ Open a Git repo in Herdr, then press your Herdr prefix key followed by `w`.
 
 ## Better together with Portboard
 
-Pair with [Portboard](https://github.com/SpaceK33z/portboard) on Linux to keep
+Pair with [Portboard](https://github.com/SpaceK33z/portboard) to keep
 each worktree's dev servers, ports, and URLs straight:
 
 - **herdr-worktrees:** create a worktree or jump into an existing one.
