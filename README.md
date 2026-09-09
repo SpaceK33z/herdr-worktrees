@@ -125,8 +125,8 @@ local branch after confirmation. Independent of `github-prs`; disable with
 For scripts and coding agents (never run raw `git worktree add`):
 
 ```bash
-herdr-worktrees create parser-fix          # prints the worktree path
-herdr-worktrees create parser-fix --json   # {path, branch, base, action, setup, workspace}
+herdr-worktrees create parser-fix          # prints a summary with the worktree path
+herdr-worktrees create parser-fix --json   # includes attachedWorkspaceId and rootPaneId
 ```
 
 Flags: `--exact` (skip prefix), `--base <ref>`, `--no-setup`, `--no-open`.
@@ -134,7 +134,31 @@ Flags: `--exact` (skip prefix), `--base <ref>`, `--no-setup`, `--no-open`.
 When the repo is already open as a Herdr workspace, the created checkout is
 attached there (unfocused) per the configured `open-mode` — its own worktree
 space, or a tab inside the repo's workspace — exactly like creating through
-the popup does. Pass `--no-open` to skip that.
+the popup does. **Reuse that attachment when launching an agent; do not create
+another workspace, tab, or split for the same checkout.**
+
+On success, `--json` writes one JSON object to stdout; Git progress and setup
+script output go to stderr. The object contains `path`, `branch`, `base`,
+`action`, `setup`, `attachedWorkspaceId`, and `rootPaneId`. Start the requested
+agent in the returned `rootPaneId`, which already has the checkout as its cwd:
+
+```bash
+# Run once, then read rootPaneId from the response:
+herdr-worktrees create parser-fix --json
+herdr agent start parser-fix --kind claude --pane <rootPaneId>
+```
+
+In workspace mode, `attachedWorkspaceId` identifies the new worktree workspace,
+not the source repo workspace. In tab mode, it identifies the repo workspace
+and `rootPaneId` identifies the new tab's pane. The legacy `workspace` field is
+an alias for `attachedWorkspaceId` (older versions incorrectly returned the
+source workspace).
+
+Pass `--no-open` to skip attachment. IDs are `null` when attachment was skipped,
+no source workspace was found, or attachment failed. Missing IDs are **not**
+permission to create duplicate layout: inspect existing workspaces/tabs by
+checkout path first. A setup failure also leaves the checkout and any attachment
+in place; resolve the failure instead of rerunning creation.
 
 ## Updating a worktree
 

@@ -37,13 +37,14 @@ pub fn git_success(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Run `git` with inherited stdio so errors and progress reach the terminal.
-/// Used for explicit user actions (fetch, worktree add) where the user should
-/// see why something failed.
+/// Stream `git` output to stderr so errors and progress reach the terminal
+/// without contaminating the caller's machine-readable stdout. Used for
+/// explicit user actions (fetch, worktree add).
 pub fn git_inherit(args: &[&str]) -> bool {
     std::process::Command::new("git")
         .env("LC_ALL", "C")
         .args(args)
+        .stdout(Stdio::from(std::io::stderr()))
         .status()
         .map(|status| status.success())
         .unwrap_or(false)

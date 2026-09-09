@@ -53,7 +53,8 @@ fn plural(count: usize) -> String {
 /// Copy the repo's `.worktreeinclude` entries into the new checkout, then run
 /// the setup script there with `WORKTREE_PATH`, `WORKTREE_BRANCH`, `REPO_PATH`
 /// and `BASE_BRANCH` in its environment. Files land before the script runs, so
-/// the script can rely on a copied `.env`.
+/// the script can rely on a copied `.env`. Script output streams to stderr,
+/// leaving stdout available for the create CLI's JSON response.
 pub fn run_setup(path: &str, branch: &str, base: &str, repo: &str, config: &Config) -> Prepared {
     let copy = include::copy_into(repo, path, config);
     let script = config.setup_script();
@@ -71,6 +72,7 @@ pub fn run_setup(path: &str, branch: &str, base: &str, repo: &str, config: &Conf
         .env("WORKTREE_BRANCH", branch)
         .env("REPO_PATH", repo)
         .env("BASE_BRANCH", util::strip_remote(base))
+        .stdout(std::process::Stdio::from(std::io::stderr()))
         .status();
     Prepared {
         copy,

@@ -113,14 +113,29 @@ pub fn run_in_pane(pane: &str, cmd: &str) {
     run(["pane", "run", pane, cmd]);
 }
 
-/// Open a worktree checkout as a workspace and return its root pane id.
-pub fn open_worktree_pane(
+/// Where Herdr attached a checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub workspace_id: String,
+    pub root_pane_id: String,
+}
+
+fn attachment_from_response(response: &Value) -> Option<Attachment> {
+    let pane = &response["result"]["root_pane"];
+    Some(Attachment {
+        workspace_id: pane["workspace_id"].as_str()?.to_string(),
+        root_pane_id: pane["pane_id"].as_str()?.to_string(),
+    })
+}
+
+/// Open a worktree checkout as a workspace and return its attachment details.
+fn open_worktree(
     root_ws: Option<&str>,
     repo: &str,
     path: &str,
     label: &str,
     focus: bool,
-) -> Option<String> {
+) -> Option<Attachment> {
     let mut args: Vec<String> = vec!["worktree".into(), "open".into()];
     if let Some(ws) = root_ws {
         args.push("--workspace".into());
@@ -134,13 +149,22 @@ pub fn open_worktree_pane(
     args.push("--label".into());
     args.push(label.to_string());
     args.push(if focus { "--focus" } else { "--no-focus" }.into());
-    json(&args)?["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .map(String::from)
+    attachment_from_response(&json(&args)?)
 }
 
-/// Open a checkout as a tab and return its root pane id.
-pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str, focus: bool) -> Option<String> {
+/// Open a worktree checkout as a workspace and return its root pane id.
+pub fn open_worktree_pane(
+    root_ws: Option<&str>,
+    repo: &str,
+    path: &str,
+    label: &str,
+    focus: bool,
+) -> Option<String> {
+    open_worktree(root_ws, repo, path, label, focus).map(|opened| opened.root_pane_id)
+}
+
+/// Open a checkout as a tab and return its attachment details.
+fn open_tab(ws: Option<&str>, path: &str, label: &str, focus: bool) -> Option<Attachment> {
     let mut args: Vec<String> = vec!["tab".into(), "create".into()];
     if let Some(ws) = ws {
         args.push("--workspace".into());
@@ -151,9 +175,12 @@ pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str, focus: bool) -> 
     args.push("--label".into());
     args.push(label.to_string());
     args.push(if focus { "--focus" } else { "--no-focus" }.into());
-    json(&args)?["result"]["root_pane"]["pane_id"]
-        .as_str()
-        .map(String::from)
+    attachment_from_response(&json(&args)?)
+}
+
+/// Open a checkout as a tab and return its root pane id.
+pub fn open_tab_pane(ws: Option<&str>, path: &str, label: &str, focus: bool) -> Option<String> {
+    open_tab(ws, path, label, focus).map(|opened| opened.root_pane_id)
 }
 
 /// Open a checkout in the configured `open-mode` and return its shell pane.
@@ -167,19 +194,19 @@ pub fn open_checkout(mode: &str, repo: &str, path: &str, label: &str) -> Option<
 
 /// Attach a checkout per the configured `open-mode`, unfocused: either as its
 /// own worktree space, or — in tab mode — as a tab inside the repo's already-
-/// open workspace. Returns the workspace id it landed in. This is what keeps a
-/// checkout created by a script or an agent from turning up later as a
-/// brand-new workspace instead of next to the rest of the repo.
-pub fn attach_checkout(mode: &str, repo: &str, path: &str, label: &str) -> Option<String> {
+/// open workspace. Returns both the workspace it landed in and its root pane,
+/// directly from Herdr's creation response. This is what keeps a checkout
+/// created by a script or an agent from turning up later as a brand-new
+/// workspace instead of next to the rest of the repo.
+pub fn attach_checkout(mode: &str, repo: &str, path: &str, label: &str) -> Option<Attachment> {
     // The repo's own space is the anchor even in tab mode: a script has no
     // business scattering tabs across whatever space happened to be focused.
     let ws = root_workspace(repo)?;
     if mode == "tab" {
-        open_tab_pane(Some(&ws), path, label, false)?;
+        open_tab(Some(&ws), path, label, false)
     } else {
-        open_worktree_pane(Some(&ws), repo, path, label, false)?;
+        open_worktree(Some(&ws), repo, path, label, false)
     }
-    Some(ws)
 }
 
 /// The repo's root workspace id (for `herdr worktree open`).
@@ -228,4 +255,38 @@ pub fn current_workspace() -> Option<String> {
     json(["pane", "current"])?["result"]["pane"]["workspace_id"]
         .as_str()
         .map(String::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attachment_uses_the_workspace_that_owns_the_created_pane() {
+        let response = serde_json::json!({
+            "result": {
+                "root_pane": {
+                    "pane_id": "wAF:p1",
+                    "workspace_id": "wAF"
+                },
+                "source_workspace_id": "w2"
+            }
+        });
+
+        assert_eq!(
+            attachment_from_response(&response),
+            Some(Attachment {
+                workspace_id: "wAF".to_string(),
+                root_pane_id: "wAF:p1".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn attachment_requires_both_ids() {
+        let response = serde_json::json!({
+            "result": { "root_pane": { "pane_id": "wAF:p1" } }
+        });
+        assert_eq!(attachment_from_response(&response), None);
+    }
 }

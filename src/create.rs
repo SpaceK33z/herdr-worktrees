@@ -143,7 +143,10 @@ const USAGE: &str = concat!(
     "worktree-path template, base resolution, fetch-before-create,\n",
     ".worktreeinclude copies, and the setup script. When the repo is already\n",
     "open as a Herdr workspace, the checkout is attached to it (unfocused);\n",
-    "pass --no-open to leave Herdr alone. Prints the worktree path.\n",
+    "pass --no-open to leave Herdr alone. Prints a summary with the worktree path.\n",
+    "With --json, stdout is one JSON object including attachedWorkspaceId and\n",
+    "rootPaneId (null when not attached). Start agents in that pane; do not\n",
+    "create another workspace or tab for the same checkout.\n",
 );
 
 /// The `create` entry point: one argument naming the branch, plus flags.
@@ -232,7 +235,10 @@ pub fn run_cli(args: &[String]) -> Result<()> {
                 "base": util::strip_remote(&created.base),
                 "action": created.action(),
                 "setup": setup_summary,
-                "workspace": attached,
+                // Legacy key, corrected to identify the destination, not the source.
+                "workspace": attached.as_ref().map(|value| &value.workspace_id),
+                "attachedWorkspaceId": attached.as_ref().map(|value| &value.workspace_id),
+                "rootPaneId": attached.as_ref().map(|value| &value.root_pane_id),
             })
         );
     } else {
@@ -243,8 +249,11 @@ pub fn run_cli(args: &[String]) -> Result<()> {
             util::strip_remote(&created.base),
             created.path
         );
-        if let Some(workspace) = attached {
-            println!("attached to herdr workspace {workspace}");
+        if let Some(attached) = attached {
+            println!(
+                "attached to herdr workspace {} (root pane {}; reuse this pane for agents)",
+                attached.workspace_id, attached.root_pane_id
+            );
         }
         if let Some(summary) = setup_summary {
             println!("{summary}");
