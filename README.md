@@ -69,6 +69,14 @@ Open a Git repo in Herdr, then press your Herdr prefix key followed by `w`.
 | Open a PR in your browser | Press `ctrl-p` |
 | Remove a worktree | Press `ctrl-d` |
 
+## Better together with Portboard
+
+Pair with [Portboard](https://github.com/SpaceK33z/portboard) on Linux to keep
+each worktree's dev servers, ports, and URLs straight:
+
+- **herdr-worktrees:** create a worktree or jump into an existing one.
+- **Portboard:** find its running servers, start or stop targets, and open the right URL—from a Herdr popup, CLI, or local dashboard.
+
 ## Make it yours
 
 The plugin can detect your existing worktree layout. Customize paths, branch
