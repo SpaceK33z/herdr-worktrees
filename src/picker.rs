@@ -147,7 +147,13 @@ fn delete_selected(selection: Option<PickerRow>, context: &PickerContext) -> Res
             && !row.path.is_empty()
             && row.path != context.repo
     }) {
-        remove::delete_worktree(row.branch, row.path, context.config, context.repo)?;
+        remove::delete_worktree(
+            row.branch,
+            row.path,
+            context.config,
+            context.repo,
+            remove::RemoveOptions::default(),
+        )?;
     }
     Ok(AfterAction::Redraw)
 }

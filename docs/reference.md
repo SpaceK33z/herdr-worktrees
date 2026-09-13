@@ -150,6 +150,12 @@ verdict after an untracked-file scan: green `✓ safe`, red `⚠ dirty`, yellow
 `⚠ unpublished` (branch has unpushed commits) or `⚠ detached`. Multi-select with
 `tab`, confirm with `enter`. Warned rows need confirmation unless
 `[remove].force = true`. Local branches are kept unless `delete-branch = true`.
+
+From a script, `herdr-worktrees remove --target <branch> <path> --yes` (or `-y`)
+skips the prompt so no terminal is needed; it still refuses a dirty, unpublished
+or detached worktree unless `--force` (`-f`) is also passed, which is the
+command-line form of `[remove].force`. The removal itself runs detached, as it
+does from the popup.
 With it on, a branch is deleted without confirmation when its content is
 already on the base branch — fully pushed, or landed via squash merge/rebase
 (detected by content probes up to a simulated `git merge-tree`). A branch

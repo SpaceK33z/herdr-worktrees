@@ -28,6 +28,7 @@ use anyhow::Result;
 const USAGE: &str = concat!(
     "usage: herdr-worktrees [open|picker|create|remover|remove|setup|detect|include] [args...]\n",
     "       herdr-worktrees create <branch> [--base <ref>] [--exact] [--json] [--no-setup]\n",
+    "       herdr-worktrees remove --target <branch> <path> [--yes|-y] [--force|-f]\n",
     "       herdr-worktrees [--json|--fzf|--header] [--no-cache|--no-detached|--fast]"
 );
 

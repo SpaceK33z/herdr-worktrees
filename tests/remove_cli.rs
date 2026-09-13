@@ -93,21 +93,7 @@ impl Fixture {
     }
     fn remove(&self, mode: &str) -> Output {
         let head = self.git(&["rev-parse", "refs/heads/feature"]);
-        Command::new(env!("CARGO_BIN_EXE_herdr-worktrees"))
-            .current_dir(&self.repo)
-            .env("HERDR_BIN_PATH", "/bin/true")
-            .env("HERDR_PLUGIN_CONFIG_DIR", self.root.join("config"))
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    self.root.join("bin").display(),
-                    std::env::var("PATH").unwrap()
-                ),
-            )
-            .env("REAL_GIT", &self.git)
-            .env("FIXTURE", &self.root)
-            .env("MODE", mode)
+        self.run(mode)
             .args([
                 "remove-bg-batch",
                 self.repo.to_str().unwrap(),
@@ -118,6 +104,56 @@ impl Fixture {
             ])
             .output()
             .unwrap()
+    }
+    /// The `remove --target` entry point, with stdin closed like a script's.
+    fn remove_target(&self, flags: &[&str]) -> Output {
+        self.run("")
+            .args([
+                "remove",
+                "--target",
+                "feature",
+                self.worktree.to_str().unwrap(),
+            ])
+            .args(flags)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+    /// Poll until the detached removal worker has finished (or given up).
+    fn wait_for_removal(&self) -> String {
+        let logs = self.root.join("state/logs");
+        for _ in 0..200 {
+            if let Ok(entries) = fs::read_dir(&logs) {
+                for entry in entries.flatten() {
+                    let log = fs::read_to_string(entry.path()).unwrap_or_default();
+                    if log.contains("__HERDR_WORKTREE_REMOVE_DONE__") {
+                        return log;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("removal worker never finished");
+    }
+    fn run(&self, mode: &str) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_herdr-worktrees"));
+        command
+            .current_dir(&self.repo)
+            .env("HERDR_BIN_PATH", "/bin/true")
+            .env("HERDR_PLUGIN_CONFIG_DIR", self.root.join("config"))
+            .env("HERDR_PLUGIN_STATE_DIR", self.root.join("state"))
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .env("REAL_GIT", &self.git)
+            .env("FIXTURE", &self.root)
+            .env("MODE", mode);
+        command
     }
     fn branch_exists(&self) -> bool {
         Command::new(&self.git)
@@ -390,4 +426,74 @@ esac
         .unwrap();
     f.git(&["worktree", "remove", "--force", "--force", reservation]);
     fs::remove_dir(Path::new(reservation).parent().unwrap()).unwrap();
+}
+
+fn combined_output(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn remove_target_needs_a_terminal_without_yes() {
+    let f = Fixture::new();
+    let out = f.remove_target(&[]);
+    let log = combined_output(&out);
+    assert!(log.contains("stdin is not a terminal"), "{log}");
+    assert!(f.worktree.exists());
+    assert!(f.branch_exists());
+}
+
+#[test]
+fn remove_target_yes_removes_a_safe_worktree_without_a_terminal() {
+    let f = Fixture::new();
+    let out = f.remove_target(&["--yes"]);
+    let log = combined_output(&out);
+    assert!(out.status.success(), "{log}");
+    assert!(
+        log.contains("removing 'feature' in the background"),
+        "{log}"
+    );
+    let worker = f.wait_for_removal();
+    assert!(worker.contains("Removed 'feature'"), "{worker}");
+    assert!(!f.worktree.exists());
+    assert!(!f.branch_exists());
+}
+
+#[test]
+fn remove_target_yes_refuses_risky_worktrees_without_force() {
+    let f = Fixture::new();
+    f.unpublished();
+    let out = f.remove_target(&["-y"]);
+    let log = combined_output(&out);
+    assert!(!out.status.success(), "{log}");
+    assert!(log.contains("'feature' has unpublished commits"), "{log}");
+    assert!(log.contains("pass --force"), "{log}");
+    assert!(f.worktree.exists());
+    assert!(f.branch_exists());
+}
+
+#[test]
+fn remove_target_yes_force_removes_a_risky_worktree() {
+    let f = Fixture::new();
+    fs::write(f.worktree.join("scratch"), "wip\n").unwrap();
+    let out = f.remove_target(&["--yes", "--force"]);
+    let log = combined_output(&out);
+    assert!(out.status.success(), "{log}");
+    let worker = f.wait_for_removal();
+    assert!(worker.contains("Removed 'feature'"), "{worker}");
+    assert!(!f.worktree.exists());
+}
+
+#[test]
+fn remove_target_rejects_unknown_flags() {
+    let f = Fixture::new();
+    let out = f.remove_target(&["--now"]);
+    let log = combined_output(&out);
+    assert!(!out.status.success());
+    assert!(log.contains("unknown argument '--now'"), "{log}");
+    assert!(log.contains("usage: remove --target"), "{log}");
+    assert!(f.worktree.exists());
 }

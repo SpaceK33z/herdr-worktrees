@@ -246,7 +246,7 @@ pub fn run_interactive() -> Result<()> {
     if targets.is_empty() {
         return Ok(());
     }
-    delete_worktrees(&targets, &config, &repo)
+    delete_worktrees(&targets, &config, &repo, RemoveOptions::default())
 }
 
 /// Print the untracked-aware candidate list used by fzf's background reload.
@@ -424,29 +424,63 @@ fn append_safety_tag(safety: &str, note: Option<&str>) -> String {
     }
 }
 
-/// The `remove --target <branch> <path>` one-off delete used by the picker's
-/// ctrl-d. The row's cached kind and changes used to be passed along too; the
-/// removal re-inspects both, so they are no longer part of the protocol.
-pub fn run_target(args: &[String]) -> Result<()> {
-    if args.first().map(String::as_str) != Some("--target") || args.len() != 3 {
-        anyhow::bail!("usage: remove --target <branch> <path>");
+const TARGET_USAGE: &str = "usage: remove --target <branch> <path> [--yes|-y] [--force|-f]";
+
+/// Command-line overrides for the confirmation step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemoveOptions {
+    /// Skip the confirmation prompt, so the removal works without a TTY.
+    /// Risky targets are still refused unless `force` is set.
+    pub assume_yes: bool,
+    /// Remove despite dirty files, unpublished commits, or a detached HEAD;
+    /// the same as `[remove].force = true`.
+    pub force: bool,
+}
+
+fn parse_target_args(args: &[String]) -> Result<(&str, &str, RemoveOptions)> {
+    let [target, branch, path, flags @ ..] = args else {
+        anyhow::bail!("{TARGET_USAGE}");
+    };
+    if target != "--target" || branch.is_empty() || path.is_empty() {
+        anyhow::bail!("{TARGET_USAGE}");
     }
-    let branch = &args[1];
-    let path = &args[2];
+    let mut options = RemoveOptions::default();
+    for flag in flags {
+        match flag.as_str() {
+            "--yes" | "-y" => options.assume_yes = true,
+            "--force" | "-f" => options.force = true,
+            other => anyhow::bail!("unknown argument '{other}'\n{TARGET_USAGE}"),
+        }
+    }
+    Ok((branch, path, options))
+}
+
+/// The `remove --target <branch> <path>` one-off delete used by the picker's
+/// ctrl-d, and by scripts with `--yes`. The row's cached kind and changes used
+/// to be passed along too; the removal re-inspects both, so they are no longer
+/// part of the protocol.
+pub fn run_target(args: &[String]) -> Result<()> {
+    let (branch, path, options) = parse_target_args(args)?;
 
     let repo_path = git::repo_root()?;
     let repo = repo_path.to_string_lossy().into_owned();
-    if path.as_str() == repo.as_str() {
+    if path == repo.as_str() {
         tty::err("the main checkout can't be removed");
         return Ok(());
     }
     let config = Config::load()?;
-    delete_worktree(branch, path, &config, &repo)
+    delete_worktree(branch, path, &config, &repo, options)
 }
 
 /// Confirm, remove the checkout, optionally delete the branch, and close the
 /// Herdr workspace that was open for it.
-pub fn delete_worktree(branch: &str, path: &str, config: &Config, repo: &str) -> Result<()> {
+pub fn delete_worktree(
+    branch: &str,
+    path: &str,
+    config: &Config,
+    repo: &str,
+    options: RemoveOptions,
+) -> Result<()> {
     delete_worktrees(
         &[RemovalTarget {
             branch: branch.to_string(),
@@ -454,10 +488,16 @@ pub fn delete_worktree(branch: &str, path: &str, config: &Config, repo: &str) ->
         }],
         config,
         repo,
+        options,
     )
 }
 
-fn delete_worktrees(targets: &[RemovalTarget], config: &Config, repo: &str) -> Result<()> {
+fn delete_worktrees(
+    targets: &[RemovalTarget],
+    config: &Config,
+    repo: &str,
+    options: RemoveOptions,
+) -> Result<()> {
     if targets.iter().any(|target| target.path == repo) {
         tty::err("the main checkout can't be removed");
         return Ok(());
@@ -483,9 +523,17 @@ fn delete_worktrees(targets: &[RemovalTarget], config: &Config, repo: &str) -> R
         .iter()
         .filter_map(|target| target.authorized_risk)
         .collect();
-    let warn = !risks.is_empty() && !config.force();
-    let prompt = removal_prompt(targets, &risks, warn);
-    if !tty::confirm(&prompt) {
+    let warn = !risks.is_empty() && !(options.force || config.force());
+    if options.assume_yes {
+        // `--yes` answers the plain prompt only: a script must say `--force`
+        // to discard work, the same way an interactive user sees the warning.
+        if warn {
+            anyhow::bail!(
+                "{}; nothing was removed — pass --force to remove anyway",
+                removal_refusal(targets, &risks)
+            );
+        }
+    } else if !tty::confirm(&removal_prompt(targets, &risks, warn)) {
         return Ok(());
     }
 
@@ -615,6 +663,19 @@ fn removal_prompt(targets: &[RemovalTarget], risks: &[RemovalRisk], warn: bool) 
     } else {
         format!(
             "  remove {} selected worktrees? enter to confirm, any other key to cancel",
+            targets.len()
+        )
+    }
+}
+
+/// The `--yes` counterpart of a warning prompt: what stops the removal.
+fn removal_refusal(targets: &[RemovalTarget], risks: &[RemovalRisk]) -> String {
+    if targets.len() == 1 {
+        format!("'{}' has {}", targets[0].branch, risks[0].description())
+    } else {
+        format!(
+            "{} of {} selected worktrees are not safe to remove",
+            risks.len(),
             targets.len()
         )
     }
