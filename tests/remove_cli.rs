@@ -14,10 +14,19 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        // The clock alone is not unique: macOS reports `as_nanos` at only
+        // microsecond granularity, so two fixtures built in the same tick on
+        // different test threads would share a directory and race each other's
+        // `git init` over the template files. The counter keeps them apart.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         let root = std::env::temp_dir().join(format!(
             "herdr-remove-regression-{}-{nonce}",
             std::process::id()
