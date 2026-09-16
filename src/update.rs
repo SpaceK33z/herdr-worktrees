@@ -586,6 +586,11 @@ codex = ["--dangerously-bypass-approvals-and-sandbox"]
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
+        // `bring_in` shells out to git itself, so the identity has to live on
+        // the repo: the env vars below only cover this helper's own commands,
+        // and CI runners have no global identity to fall back on.
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "t"]);
         std::fs::write(root.join("f"), "base\n").unwrap();
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "base"]);

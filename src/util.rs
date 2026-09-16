@@ -67,6 +67,20 @@ pub fn normalize_path(path: &str) -> String {
     }
 }
 
+/// Whether two paths name the same directory. A symlinked parent (macOS hides
+/// `/var/folders` behind `/private/var`) means the path git reports and the one
+/// we were handed can differ as strings while naming one worktree — and the
+/// main checkout has to be recognized as the main checkout however it is spelt.
+pub fn same_path(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Single-quote a string for safe embedding in a POSIX shell command.
 pub fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -155,7 +169,7 @@ pub fn parallel_map<T: Sync, R: Send>(
 
 #[cfg(test)]
 mod tests {
-    use super::{parallel_map, self_exe, write_atomic, write_json_atomic};
+    use super::{parallel_map, same_path, self_exe, write_atomic, write_json_atomic};
 
     #[test]
     fn parallel_map_preserves_order_and_survives_a_panicking_item() {
@@ -249,5 +263,26 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         );
+    }
+
+    #[test]
+    fn a_symlinked_parent_still_counts_as_the_same_path() {
+        let root = std::env::temp_dir().join(format!("herdr-same-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let real = real.to_string_lossy().into_owned();
+        let link = link.to_string_lossy().into_owned();
+        assert!(same_path(&real, &real));
+        assert!(same_path(&link, &real));
+        assert!(!same_path(&real, &root.join("other").to_string_lossy()));
+        // Paths that do not exist fall back to comparing the strings.
+        assert!(same_path("/nowhere/x", "/nowhere/x"));
+        assert!(!same_path("/nowhere/x", "/nowhere/y"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

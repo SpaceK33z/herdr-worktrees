@@ -279,7 +279,7 @@ fn render_remove_candidates(
     let removable: Vec<_> = engine
         .worktrees
         .iter()
-        .filter(|worktree| worktree.path != repo)
+        .filter(|worktree| !util::same_path(&worktree.path, repo))
         .collect();
     let inspections = inspect.then(|| inspect_candidates(&removable, config, repo));
     let mut rows = Vec::with_capacity(removable.len());
@@ -498,7 +498,10 @@ fn delete_worktrees(
     repo: &str,
     options: RemoveOptions,
 ) -> Result<()> {
-    if targets.iter().any(|target| target.path == repo) {
+    if targets
+        .iter()
+        .any(|target| util::same_path(&target.path, repo))
+    {
         tty::err("the main checkout can't be removed");
         return Ok(());
     }
@@ -523,7 +526,7 @@ fn delete_worktrees(
         .iter()
         .filter_map(|target| target.authorized_risk)
         .collect();
-    let warn = !risks.is_empty() && !(options.force || config.force());
+    let warn = !(risks.is_empty() || options.force || config.force());
     if options.assume_yes {
         // `--yes` answers the plain prompt only: a script must say `--force`
         // to discard work, the same way an interactive user sees the warning.

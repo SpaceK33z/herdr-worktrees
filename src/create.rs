@@ -321,7 +321,23 @@ mod tests {
         assert!(git::git_success(&[
             "-C", &repo, "init", "--quiet", "-b", "main"
         ]));
-        git::git_stdout(&[
+        // CI runners have no global identity, and `git commit` refuses without
+        // one, so pin it on the repo rather than inheriting the developer's.
+        assert!(git::git_success(&[
+            "-C",
+            &repo,
+            "config",
+            "user.email",
+            "test@example.com"
+        ]));
+        assert!(git::git_success(&[
+            "-C",
+            &repo,
+            "config",
+            "user.name",
+            "Test User"
+        ]));
+        assert!(git::git_success(&[
             "-C",
             &repo,
             "commit",
@@ -329,7 +345,7 @@ mod tests {
             "--quiet",
             "-m",
             "init",
-        ]);
+        ]));
         let parent = dir.to_string_lossy().into_owned();
         (parent, repo)
     }
