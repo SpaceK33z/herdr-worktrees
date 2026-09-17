@@ -464,7 +464,7 @@ pub fn run_target(args: &[String]) -> Result<()> {
 
     let repo_path = git::repo_root()?;
     let repo = repo_path.to_string_lossy().into_owned();
-    if path == repo.as_str() {
+    if util::same_path(path, &repo) {
         tty::err("the main checkout can't be removed");
         return Ok(());
     }
@@ -505,6 +505,13 @@ fn delete_worktrees(
         tty::err("the main checkout can't be removed");
         return Ok(());
     }
+
+    // A path typed by hand can be relative to the shell's cwd, or reach the
+    // worktree through a symlinked parent. Everything past this point — the
+    // progress pane's cwd, the detached worker's argv, `git worktree remove`
+    // itself — needs the absolute path git recorded, so resolve the spelling
+    // once, here.
+    let targets = &resolve_registered_paths(targets, repo);
 
     // Re-check identity, HEAD, dirty files, and publication state immediately
     // before confirmation. A failed probe cancels rather than becoming `safe`.
@@ -715,6 +722,28 @@ fn inspect_target(target: &RemovalTarget, config: &Config, repo: &str) -> Result
     inspect_target_in_records(target, &records, config, repo)
 }
 
+/// Rewrite each target's path to the one git has registered for that
+/// directory, so a relative or symlinked spelling names the same worktree. A
+/// path that matches nothing is left alone: inspection reports it as
+/// unregistered, which is the honest answer. A failed listing is left to the
+/// inspection step to report too.
+fn resolve_registered_paths(targets: &[RemovalTarget], repo: &str) -> Vec<RemovalTarget> {
+    let records = registered_worktrees(repo).unwrap_or_default();
+    targets
+        .iter()
+        .map(|target| {
+            let path = records
+                .iter()
+                .find(|record| util::same_path(&record.path, &target.path))
+                .map_or_else(|| target.path.clone(), |record| record.path.clone());
+            RemovalTarget {
+                branch: target.branch.clone(),
+                path,
+            }
+        })
+        .collect()
+}
+
 fn registered_worktrees(repo: &str) -> Result<Vec<model::RawWorktree>> {
     let output = git::git_output(&["-C", repo, "worktree", "list", "--porcelain"])
         .context("listing registered worktrees")?;
@@ -734,7 +763,7 @@ fn inspect_target_in_records(
 ) -> Result<PreparedRemoval> {
     let record = records
         .iter()
-        .find(|record| record.path == target.path)
+        .find(|record| util::same_path(&record.path, &target.path))
         .with_context(|| format!("{} is no longer a registered worktree", target.path))?;
     let actual_branch = if record.branch.is_empty() {
         "(detached)"
@@ -748,7 +777,7 @@ fn inspect_target_in_records(
         );
     }
 
-    let changes = inspect_changes(&target.path)?;
+    let changes = inspect_changes(&record.path)?;
     let detached = record.branch.is_empty();
     let (safety, unpublished) = if config.delete_branch() && !detached {
         let safety = branch_deletion_safety_at(config, repo, &record.branch, &record.head)?;
@@ -765,13 +794,13 @@ fn inspect_target_in_records(
     let kept_by_checkout = records
         .iter()
         .find(|other| {
-            other.path != target.path && !other.branch.is_empty() && other.branch == record.branch
+            other.path != record.path && !other.branch.is_empty() && other.branch == record.branch
         })
         .map(|other| other.path.clone());
 
     Ok(PreparedRemoval {
         branch: target.branch.clone(),
-        path: target.path.clone(),
+        path: record.path.clone(),
         head: record.head.clone(),
         authorized_risk: removal_risk(changes.dirty(), unpublished, detached),
         safety,
@@ -1882,9 +1911,9 @@ mod tests {
         build_remove_bind, changes_display, decode_batch_args, delete_branch_ref,
         deletion_safety_tag, encode_batch_args, follow_progress, freed_suffix, inspect_target,
         parse_pid_header, parse_targets, perform_delete, process_is_running, removal_risk,
-        remove_fzf_args, render_remove_candidates, risk_is_covered, sync_has_unpublished,
-        validate_and_delete, ChangeCounts, DeletionSafety, PreparedRemoval, ProgressOutcome,
-        RemovalRisk, RemovalTarget, RetentionProof, SyncKind,
+        remove_fzf_args, render_remove_candidates, resolve_registered_paths, risk_is_covered,
+        sync_has_unpublished, validate_and_delete, ChangeCounts, DeletionSafety, PreparedRemoval,
+        ProgressOutcome, RemovalRisk, RemovalTarget, RetentionProof, SyncKind,
     };
     use crate::config::Config;
     use indicatif::ProgressBar;
@@ -2268,6 +2297,67 @@ mod tests {
             validate_and_delete(&prepared, &Config::default(), repo.to_str().unwrap()).is_err()
         );
         assert!(worktree.is_dir());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_differently_spelled_path_still_names_the_registered_worktree() {
+        let root = unique_root("path-spelling");
+        let repo = root.join("repo");
+        let worktree = repo.join(".worktrees/feature");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        let registered = worktree
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let repo_str = repo.to_str().unwrap();
+
+        // The same directory reached through `..`, the way a shell-relative
+        // path reaches it once canonicalized.
+        let detoured = repo
+            .join("seed/../.worktrees/feature")
+            .to_string_lossy()
+            .into_owned();
+        let target = RemovalTarget {
+            branch: "feature".to_string(),
+            path: detoured.clone(),
+        };
+        let prepared = inspect_target(&target, &Config::default(), repo_str).unwrap();
+        // Inspection succeeds, and hands git's own spelling to the deletion.
+        assert_eq!(prepared.path, registered);
+
+        let resolved = resolve_registered_paths(std::slice::from_ref(&target), repo_str);
+        assert_eq!(resolved[0].path, registered);
+
+        // An unregistered path is left as typed, and still reported as such.
+        let stranger = RemovalTarget {
+            branch: "feature".to_string(),
+            path: repo.join(".worktrees/other").to_string_lossy().into_owned(),
+        };
+        assert_eq!(
+            resolve_registered_paths(std::slice::from_ref(&stranger), repo_str)[0].path,
+            stranger.path
+        );
+        let error = inspect_target(&stranger, &Config::default(), repo_str)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is no longer a registered worktree"),
+            "{error}"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
