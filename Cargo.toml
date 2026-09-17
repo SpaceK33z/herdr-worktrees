@@ -1,6 +1,6 @@
 [package]
 name = "herdr-worktrees"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Switch, create, and remove git worktrees from a Herdr popup"
