@@ -1,7 +1,7 @@
 id = "worktrees"
 name = "herdr-worktrees"
 # x-release-please-start-version
-version = "0.2.0"
+version = "0.3.0"
 # x-release-please-end
 min_herdr_version = "0.7.4"
 description = "Switch, create, and remove git worktrees from a popup, with branch sync, PR status, and setup hooks."
